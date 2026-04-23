@@ -1,0 +1,6 @@
+__pycache__/
+archive/
+.clawd-agents/
+# Local agent artifacts
+.claude/settings.local.json
+.claude/sessions/
