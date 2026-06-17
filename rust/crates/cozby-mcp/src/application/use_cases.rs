@@ -163,6 +163,65 @@ pub fn dispatch(
 }
 
 // --------------------------------------------------------------------------
+// Контракты (HTTP-сервисы как MCP-инструменты). Чистая подготовка запроса и
+// разбор ответа живут в `domain::contract`; здесь — маршрутизация по имени,
+// резолв заголовков (env) и вызов транспорта.
+// --------------------------------------------------------------------------
+
+use crate::application::ports::HttpTransport;
+use crate::domain::{contract, Contract};
+
+/// Подставляет `${env:VAR}` в значениях заголовков. Чтение env — здесь
+/// (application), а не в чистом домене. Неизвестная переменная → пустая строка.
+fn resolve_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
+    let env_ref = regex::Regex::new(r"\$\{env:([A-Za-z_][A-Za-z0-9_]*)\}")
+        .expect("env-ref regex is valid");
+    headers
+        .iter()
+        .map(|(name, value)| {
+            let resolved = env_ref
+                .replace_all(value, |caps: &regex::Captures| {
+                    std::env::var(&caps[1]).unwrap_or_default()
+                })
+                .into_owned();
+            (name.clone(), resolved)
+        })
+        .collect()
+}
+
+/// Исполняет инструмент контракта: ищет его по имени среди контрактов, готовит
+/// запрос (домен), шлёт через транспорт, извлекает и форматирует ответ.
+pub fn dispatch_contract(
+    transport: &dyn HttpTransport,
+    contracts: &[Contract],
+    name: &str,
+    args: &JsonValue,
+) -> Result<String, DomainError> {
+    for service in contracts {
+        let Some(tool) = service.tools.iter().find(|tool| tool.name == name) else {
+            continue;
+        };
+        let prepared = contract::prepare(tool, args)?;
+        let url = format!(
+            "{}{}",
+            service.base_url.trim_end_matches('/'),
+            prepared.path
+        );
+        let headers = resolve_headers(&service.headers);
+        let body = transport.send(
+            prepared.method,
+            &url,
+            &prepared.query,
+            &headers,
+            prepared.body.as_ref(),
+        )?;
+        let extracted = contract::extract_response(&body, &tool.response_pointer);
+        return Ok(contract::format_response(&extracted));
+    }
+    Err(DomainError::MissingArgument("tool name"))
+}
+
+// --------------------------------------------------------------------------
 // Тесты используют in-memory FS из `infrastructure::in_memory_fs`, чтобы
 // проверить бизнес-правила без выхода на настоящую файловую систему.
 // --------------------------------------------------------------------------
@@ -259,5 +318,154 @@ mod tests {
         let (fs, root) = fs_with_files(&[]);
         let err = dispatch(&fs, &root, "delete_universe", &json!({})).unwrap_err();
         assert!(matches!(err, DomainError::MissingArgument(_)));
+    }
+
+    // ----------------------------------------------------------------------
+    // Контракты — мок транспорта фиксирует исходящий запрос и отдаёт заранее
+    // заданное тело, чтобы проверить маршрутизацию/подготовку/разбор без сети.
+    // ----------------------------------------------------------------------
+
+    use super::dispatch_contract;
+    use crate::application::ports::HttpTransport;
+    use crate::domain::{
+        Contract, ContractParam, ContractTool, HttpMethod, ParamLocation,
+    };
+    use serde_json::Value as JsonValue;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct MockTransport {
+        last_url: Mutex<Option<String>>,
+        last_body: Mutex<Option<JsonValue>>,
+        last_headers: Mutex<Option<Vec<(String, String)>>>,
+        reply: JsonValue,
+    }
+
+    impl HttpTransport for MockTransport {
+        fn send(
+            &self,
+            _method: HttpMethod,
+            url: &str,
+            query: &[(String, String)],
+            headers: &[(String, String)],
+            body: Option<&JsonValue>,
+        ) -> Result<JsonValue, DomainError> {
+            let full = if query.is_empty() {
+                url.to_string()
+            } else {
+                let qs = query
+                    .iter()
+                    .map(|(k, v)| format!("{k}={v}"))
+                    .collect::<Vec<_>>()
+                    .join("&");
+                format!("{url}?{qs}")
+            };
+            *self.last_url.lock().unwrap() = Some(full);
+            *self.last_body.lock().unwrap() = body.cloned();
+            *self.last_headers.lock().unwrap() = Some(headers.to_vec());
+            Ok(self.reply.clone())
+        }
+    }
+
+    fn note_contract() -> Contract {
+        Contract {
+            name: "svc".to_string(),
+            base_url: "http://localhost:8081/".to_string(),
+            headers: vec![("Authorization".to_string(), "Bearer ${env:CONSULT_TEST_TOKEN}".to_string())],
+            tools: vec![
+                ContractTool {
+                    name: "save_note".to_string(),
+                    description: "save".to_string(),
+                    method: HttpMethod::Post,
+                    path: "/api/notes".to_string(),
+                    response_pointer: "data".to_string(),
+                    params: vec![ContractParam {
+                        name: "title".to_string(),
+                        wire_name: "title".to_string(),
+                        location: ParamLocation::Body,
+                        json_type: "string".to_string(),
+                        required: true,
+                        description: None,
+                    }],
+                },
+                ContractTool {
+                    name: "search".to_string(),
+                    description: "search".to_string(),
+                    method: HttpMethod::Get,
+                    path: "/api/notes/search".to_string(),
+                    response_pointer: "data".to_string(),
+                    params: vec![ContractParam {
+                        name: "query".to_string(),
+                        wire_name: "q".to_string(),
+                        location: ParamLocation::Query,
+                        json_type: "string".to_string(),
+                        required: true,
+                        description: None,
+                    }],
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn dispatch_contract_posts_body_and_extracts_data() {
+        let transport = MockTransport {
+            reply: json!({ "status": "ok", "data": { "id": "n1", "title": "Hi" } }),
+            ..Default::default()
+        };
+        let contracts = vec![note_contract()];
+        let out = dispatch_contract(&transport, &contracts, "save_note", &json!({"title": "T"}))
+            .unwrap();
+        // base_url trailing slash trimmed; body carries the note title.
+        assert_eq!(
+            transport.last_url.lock().unwrap().as_deref(),
+            Some("http://localhost:8081/api/notes")
+        );
+        assert_eq!(transport.last_body.lock().unwrap().as_ref().unwrap()["title"], "T");
+        // response_pointer "data" extracted and pretty-printed.
+        assert!(out.contains("\"id\": \"n1\""), "got: {out}");
+    }
+
+    #[test]
+    fn dispatch_contract_maps_query_param_wire_name() {
+        let transport = MockTransport {
+            reply: json!({ "data": [] }),
+            ..Default::default()
+        };
+        let contracts = vec![note_contract()];
+        let _ = dispatch_contract(&transport, &contracts, "search", &json!({"query": "foo"}))
+            .unwrap();
+        assert_eq!(
+            transport.last_url.lock().unwrap().as_deref(),
+            Some("http://localhost:8081/api/notes/search?q=foo")
+        );
+    }
+
+    #[test]
+    fn dispatch_contract_resolves_env_headers() {
+        std::env::set_var("CONSULT_TEST_TOKEN", "secret-xyz");
+        let transport = MockTransport {
+            reply: json!({ "data": {} }),
+            ..Default::default()
+        };
+        let contracts = vec![note_contract()];
+        let _ = dispatch_contract(&transport, &contracts, "save_note", &json!({"title": "T"}))
+            .unwrap();
+        let headers = transport.last_headers.lock().unwrap().clone().unwrap();
+        assert!(headers
+            .iter()
+            .any(|(k, v)| k == "Authorization" && v == "Bearer secret-xyz"));
+        std::env::remove_var("CONSULT_TEST_TOKEN");
+    }
+
+    #[test]
+    fn dispatch_contract_rejects_unknown_and_missing_field() {
+        let transport = MockTransport::default();
+        let contracts = vec![note_contract()];
+        let unknown = dispatch_contract(&transport, &contracts, "nope", &json!({})).unwrap_err();
+        assert!(matches!(unknown, DomainError::MissingArgument(_)));
+        let missing =
+            dispatch_contract(&transport, &contracts, "save_note", &json!({})).unwrap_err();
+        assert!(matches!(missing, DomainError::MissingField(f) if f == "title"));
     }
 }

@@ -128,6 +128,20 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         resume_supported: true,
     },
     SlashCommandSpec {
+        name: "brain",
+        aliases: &[],
+        summary: "Enable/disable cozby-brain notes & docs integration",
+        argument_hint: Some("[on [url]|off|status]"),
+        resume_supported: true,
+    },
+    SlashCommandSpec {
+        name: "external",
+        aliases: &[],
+        summary: "Show external-model consultation status (anonymized, reviewed)",
+        argument_hint: Some("[status]"),
+        resume_supported: true,
+    },
+    SlashCommandSpec {
         name: "memory",
         aliases: &[],
         summary: "Inspect loaded Claude instruction memory files",
@@ -1084,6 +1098,13 @@ pub enum SlashCommand {
         action: Option<String>,
         target: Option<String>,
     },
+    Brain {
+        action: Option<String>,
+        target: Option<String>,
+    },
+    External {
+        action: Option<String>,
+    },
     Memory,
     Init,
     Diff,
@@ -1283,6 +1304,8 @@ pub fn validate_slash_command_input(
             section: parse_config_section(&args)?,
         },
         "mcp" => parse_mcp_command(&args)?,
+        "brain" => parse_brain_command(&args)?,
+        "external" => parse_external_command(&args)?,
         "memory" => {
             validate_no_args(command, &args)?;
             SlashCommand::Memory
@@ -1580,6 +1603,58 @@ fn parse_mcp_command(args: &[&str]) -> Result<SlashCommand, SlashCommandParseErr
     }
 }
 
+fn parse_brain_command(args: &[&str]) -> Result<SlashCommand, SlashCommandParseError> {
+    match args {
+        [] | ["status"] => Ok(SlashCommand::Brain {
+            action: Some("status".to_string()),
+            target: None,
+        }),
+        ["on"] => Ok(SlashCommand::Brain {
+            action: Some("on".to_string()),
+            target: None,
+        }),
+        ["on", url] => Ok(SlashCommand::Brain {
+            action: Some("on".to_string()),
+            target: Some((*url).to_string()),
+        }),
+        ["on", ..] => Err(command_error(
+            "Unexpected arguments for /brain on.",
+            "brain",
+            "/brain on [url]",
+        )),
+        ["off"] => Ok(SlashCommand::Brain {
+            action: Some("off".to_string()),
+            target: None,
+        }),
+        ["status" | "off", ..] => Err(usage_error("brain", "[on [url]|off|status]")),
+        ["help" | "-h" | "--help"] => Ok(SlashCommand::Brain {
+            action: Some("help".to_string()),
+            target: None,
+        }),
+        [action, ..] => Err(command_error(
+            &format!("Unknown /brain action '{action}'. Use on [url], off, status, or help."),
+            "brain",
+            "/brain [on [url]|off|status]",
+        )),
+    }
+}
+
+fn parse_external_command(args: &[&str]) -> Result<SlashCommand, SlashCommandParseError> {
+    match args {
+        [] | ["status"] => Ok(SlashCommand::External {
+            action: Some("status".to_string()),
+        }),
+        ["help" | "-h" | "--help"] => Ok(SlashCommand::External {
+            action: Some("help".to_string()),
+        }),
+        [action, ..] => Err(command_error(
+            &format!("Unknown /external action '{action}'. Use status or help."),
+            "external",
+            "/external [status]",
+        )),
+    }
+}
+
 fn parse_plugin_command(args: &[&str]) -> Result<SlashCommand, SlashCommandParseError> {
     match args {
         [] => Ok(SlashCommand::Plugins {
@@ -1793,8 +1868,8 @@ fn slash_command_category(name: &str) -> &'static str {
         | "export" | "plugin" | "branch" | "add-dir" | "files" | "hooks" | "release-notes" => {
             "Workspace & git"
         }
-        "agents" | "skills" | "teleport" | "debug-tool-call" | "mcp" | "context" | "tasks"
-        | "doctor" | "ide" | "desktop" => "Discovery & debugging",
+        "agents" | "skills" | "teleport" | "debug-tool-call" | "mcp" | "brain" | "external"
+        | "context" | "tasks" | "doctor" | "ide" | "desktop" => "Discovery & debugging",
         "bughunter" | "ultraplan" | "review" | "security-review" | "advisor" | "insights" => {
             "Analysis & automation"
         }
@@ -2159,6 +2234,259 @@ pub fn handle_mcp_slash_command(
 ) -> Result<String, runtime::ConfigError> {
     let loader = ConfigLoader::default_for(cwd);
     render_mcp_report_for(&loader, cwd, args)
+}
+
+/// MCP-сервер cozby-brain, записываемый в `settings.json`.
+const BRAIN_SERVER_NAME: &str = "cozby-brain";
+/// Дефолтный base-URL cozby-brain, если в `/brain on` не передан явный.
+const DEFAULT_BRAIN_URL: &str = "http://localhost:8081";
+
+/// Обрабатывает `/brain [on [url]|off|status]`: включает/выключает интеграцию
+/// cozby-brain, читая-меняя-записывая **user** `settings.json` (mcpServers).
+///
+/// Возвращает человекочитаемый отчёт. JSON-/валидационные ошибки оборачиваются
+/// в [`std::io::Error`] (как в [`handle_skills_slash_command`]), чтобы не тянуть
+/// в крейт лишних зависимостей.
+pub fn handle_brain_slash_command(args: Option<&str>, cwd: &Path) -> std::io::Result<String> {
+    let loader = ConfigLoader::default_for(cwd);
+    let settings_path = loader.config_home().join("settings.json");
+
+    let normalized = normalize_optional_args(args);
+    let mut words = normalized.unwrap_or("status").split_whitespace();
+    match words.next() {
+        None | Some("status") => brain_status(&settings_path),
+        Some("help" | "-h" | "--help") => Ok(render_brain_usage(None)),
+        Some("on") => {
+            let url = words.next().unwrap_or(DEFAULT_BRAIN_URL);
+            brain_set_enabled(&settings_path, url)
+        }
+        Some("off") => brain_set_disabled(&settings_path),
+        Some(other) => Ok(render_brain_usage(Some(other))),
+    }
+}
+
+/// Маппинг «не-JSON / неверная структура» в `io::Error` единообразно.
+fn brain_invalid_data(message: String) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, message)
+}
+
+/// Путь к бинарю `cozby-mcp`: сначала пробуем соседа текущего исполняемого
+/// файла (в одном target-каталоге), иначе полагаемся на `PATH`.
+fn resolve_cozby_mcp_command() -> String {
+    if let Ok(exe) = env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let sibling = dir.join("cozby-mcp");
+            if sibling.is_file() {
+                return sibling.to_string_lossy().into_owned();
+            }
+        }
+    }
+    "cozby-mcp".to_string()
+}
+
+/// Читает `settings.json` как JSON-объект. Отсутствующий/пустой файл → пустой
+/// объект; не-объект на верхнем уровне → ошибка.
+fn read_settings_object(path: &Path) -> std::io::Result<serde_json::Map<String, serde_json::Value>> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error),
+    };
+    if text.trim().is_empty() {
+        return Ok(serde_json::Map::new());
+    }
+    match serde_json::from_str::<serde_json::Value>(&text) {
+        Ok(serde_json::Value::Object(map)) => Ok(map),
+        Ok(_) => Err(brain_invalid_data(format!(
+            "{}: top-level settings must be a JSON object",
+            path.display()
+        ))),
+        Err(error) => Err(brain_invalid_data(format!(
+            "{}: invalid JSON: {error}",
+            path.display()
+        ))),
+    }
+}
+
+/// Записывает JSON-объект обратно в `settings.json` (pretty + перевод строки),
+/// создавая родительский каталог при необходимости.
+fn write_settings_object(
+    path: &Path,
+    root: &serde_json::Map<String, serde_json::Value>,
+) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let value = serde_json::Value::Object(root.clone());
+    let mut text = serde_json::to_string_pretty(&value)
+        .map_err(|error| brain_invalid_data(format!("cannot serialize settings: {error}")))?;
+    text.push('\n');
+    fs::write(path, text)
+}
+
+/// Возвращает ссылку на URL из уже сохранённой записи cozby-brain, если она есть.
+fn brain_configured_url(root: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
+    let entry = root.get("mcpServers")?.get(BRAIN_SERVER_NAME)?;
+    let args = entry.get("args")?.as_array()?;
+    let mut iter = args.iter();
+    while let Some(item) = iter.next() {
+        if item.as_str() == Some("--brain-url") {
+            if let Some(url) = iter.next().and_then(serde_json::Value::as_str) {
+                return Some(url.to_string());
+            }
+        }
+    }
+    Some(DEFAULT_BRAIN_URL.to_string())
+}
+
+fn brain_set_enabled(path: &Path, url: &str) -> std::io::Result<String> {
+    let mut root = read_settings_object(path)?;
+    let existed = root
+        .get("mcpServers")
+        .and_then(|servers| servers.get(BRAIN_SERVER_NAME))
+        .is_some();
+
+    let entry = serde_json::json!({
+        "type": "stdio",
+        "command": resolve_cozby_mcp_command(),
+        "args": ["--brain-url", url],
+    });
+
+    let servers = root
+        .entry("mcpServers".to_string())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    let servers = servers.as_object_mut().ok_or_else(|| {
+        brain_invalid_data(format!("{}: mcpServers must be a JSON object", path.display()))
+    })?;
+    servers.insert(BRAIN_SERVER_NAME.to_string(), entry);
+
+    write_settings_object(path, &root)?;
+
+    let verb = if existed { "updated" } else { "enabled" };
+    Ok(format!(
+        "✓ cozby-brain integration {verb} (user settings)\n  \
+         url:    {url}\n  \
+         config: {}\n  \
+         tools:  save_note, search_notes, save_doc, recall\n\
+         Reconnect MCP (restart cozby-claw) for the change to take effect.",
+        path.display()
+    ))
+}
+
+fn brain_set_disabled(path: &Path) -> std::io::Result<String> {
+    let mut root = read_settings_object(path)?;
+    let removed = root
+        .get_mut("mcpServers")
+        .and_then(serde_json::Value::as_object_mut)
+        .is_some_and(|servers| servers.remove(BRAIN_SERVER_NAME).is_some());
+
+    if !removed {
+        return Ok(format!(
+            "cozby-brain integration was not configured ({}).",
+            path.display()
+        ));
+    }
+    write_settings_object(path, &root)?;
+    Ok(format!(
+        "✓ cozby-brain integration disabled (removed from {}).\n\
+         Reconnect MCP (restart cozby-claw) for the change to take effect.",
+        path.display()
+    ))
+}
+
+fn brain_status(path: &Path) -> std::io::Result<String> {
+    let root = read_settings_object(path)?;
+    match brain_configured_url(&root) {
+        Some(url) => Ok(format!(
+            "cozby-brain: enabled\n  url:    {url}\n  config: {}",
+            path.display()
+        )),
+        None => Ok(format!(
+            "cozby-brain: not configured\n  config: {}\n  enable with: /brain on [url]   (default url {DEFAULT_BRAIN_URL})",
+            path.display()
+        )),
+    }
+}
+
+fn render_brain_usage(unexpected: Option<&str>) -> String {
+    let mut lines = vec![
+        "Brain (cozby-brain notes & docs integration)".to_string(),
+        "  Usage        /brain [on [url]|off|status]".to_string(),
+        "  Direct CLI   claw brain [on [url]|off|status]".to_string(),
+        format!("  on [url]     register cozby-mcp --brain-url (default {DEFAULT_BRAIN_URL})"),
+        "  off          remove the cozby-brain MCP server".to_string(),
+        "  status       show whether it is configured".to_string(),
+        "  Scope        user settings.json".to_string(),
+    ];
+    if let Some(args) = unexpected {
+        lines.push(format!("  Unexpected   {args}"));
+    }
+    lines.join("\n")
+}
+
+/// Handles `/external [status]`: reports whether external-model consultation is
+/// configured. Read-only — enabling needs deployment-specific values and is
+/// done via the `externalConsult` block in settings.json.
+pub fn handle_external_slash_command(
+    args: Option<&str>,
+    cwd: &Path,
+) -> Result<String, runtime::ConfigError> {
+    match normalize_optional_args(args) {
+        Some("-h" | "--help" | "help") => Ok(render_external_usage()),
+        _ => {
+            let config = ConfigLoader::default_for(cwd).load()?;
+            Ok(render_external_status(config.external_consult()))
+        }
+    }
+}
+
+fn render_external_status(config: Option<&runtime::ExternalConsultConfig>) -> String {
+    let Some(config) = config else {
+        return "external model consultation: not configured\n  \
+                add an `externalConsult` block to settings.json to enable it\n  \
+                (the internal model always stays primary)"
+            .to_string();
+    };
+    if !config.enabled {
+        return "external model consultation: configured but disabled\n  \
+                set externalConsult.enabled = true in settings.json to turn it on"
+            .to_string();
+    }
+    let key_present = std::env::var(&config.api_key_env)
+        .ok()
+        .is_some_and(|value| !value.trim().is_empty());
+    let key_state = if key_present {
+        format!("set ({})", config.api_key_env)
+    } else {
+        format!("MISSING — set env {} to activate", config.api_key_env)
+    };
+    let audit = config
+        .audit_log
+        .clone()
+        .unwrap_or_else(|| ".claw/external-consult-audit.log".to_string());
+    format!(
+        "external model consultation: enabled\n  \
+         model     {}\n  \
+         endpoint  {}\n  \
+         api key   {key_state}\n  \
+         audit log {audit}\n  \
+         Every request is anonymized (namespaces/types) and shown for review before sending.",
+        config.model, config.base_url
+    )
+}
+
+fn render_external_usage() -> String {
+    [
+        "External model consultation".to_string(),
+        "  Usage      /external [status]".to_string(),
+        "  Direct CLI claw external [status]".to_string(),
+        "  status     show whether external consultation is configured".to_string(),
+        "  Enable     add an `externalConsult` block to settings.json:".to_string(),
+        "             { \"enabled\": true, \"model\": \"…\", \"baseUrl\": \"…\", \"apiKeyEnv\": \"…\" }"
+            .to_string(),
+        "  Note       internal model stays primary; sends are anonymized and reviewed".to_string(),
+    ]
+    .join("\n")
 }
 
 pub fn handle_skills_slash_command(args: Option<&str>, cwd: &Path) -> std::io::Result<String> {
@@ -3205,6 +3533,8 @@ pub fn handle_slash_command(
         | SlashCommand::Resume { .. }
         | SlashCommand::Config { .. }
         | SlashCommand::Mcp { .. }
+        | SlashCommand::Brain { .. }
+        | SlashCommand::External { .. }
         | SlashCommand::Memory
         | SlashCommand::Init
         | SlashCommand::Diff
@@ -3281,6 +3611,105 @@ mod tests {
             .expect("time should be after epoch")
             .as_nanos();
         std::env::temp_dir().join(format!("commands-plugin-{label}-{nanos}"))
+    }
+
+    #[test]
+    fn parses_brain_actions() {
+        assert_eq!(
+            SlashCommand::parse("/brain"),
+            Ok(Some(SlashCommand::Brain {
+                action: Some("status".to_string()),
+                target: None
+            }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/brain on"),
+            Ok(Some(SlashCommand::Brain {
+                action: Some("on".to_string()),
+                target: None
+            }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/brain on http://localhost:9000"),
+            Ok(Some(SlashCommand::Brain {
+                action: Some("on".to_string()),
+                target: Some("http://localhost:9000".to_string())
+            }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/brain off"),
+            Ok(Some(SlashCommand::Brain {
+                action: Some("off".to_string()),
+                target: None
+            }))
+        );
+        assert!(SlashCommand::parse("/brain wat").is_err());
+    }
+
+    #[test]
+    fn brain_enable_status_disable_roundtrip() {
+        let path = temp_dir("brain-roundtrip").join("settings.json");
+        let _ = fs::remove_file(&path);
+
+        // not configured yet
+        let status = super::brain_status(&path).unwrap();
+        assert!(status.contains("not configured"), "got: {status}");
+
+        // enable with explicit url
+        let on = super::brain_set_enabled(&path, "http://localhost:9000").unwrap();
+        assert!(on.contains("enabled"), "got: {on}");
+
+        // settings.json now has a stdio cozby-brain server pointing at the url
+        let written: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let entry = &written["mcpServers"]["cozby-brain"];
+        assert_eq!(entry["type"], "stdio");
+        assert_eq!(entry["args"][0], "--brain-url");
+        assert_eq!(entry["args"][1], "http://localhost:9000");
+
+        // status reflects the configured url
+        let status = super::brain_status(&path).unwrap();
+        assert!(status.contains("enabled"), "got: {status}");
+        assert!(status.contains("http://localhost:9000"), "got: {status}");
+
+        // re-enabling reports "updated"
+        let again = super::brain_set_enabled(&path, super::DEFAULT_BRAIN_URL).unwrap();
+        assert!(again.contains("updated"), "got: {again}");
+
+        // disable removes the entry
+        let off = super::brain_set_disabled(&path).unwrap();
+        assert!(off.contains("disabled"), "got: {off}");
+        let after: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(after["mcpServers"].get("cozby-brain").is_none());
+
+        // disabling again is a no-op message, not an error
+        let off_again = super::brain_set_disabled(&path).unwrap();
+        assert!(off_again.contains("was not configured"), "got: {off_again}");
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn brain_enable_preserves_existing_settings() {
+        let path = temp_dir("brain-preserve").join("settings.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            r#"{"model":"haiku","mcpServers":{"other":{"command":"x"}}}"#,
+        )
+        .unwrap();
+
+        super::brain_set_enabled(&path, super::DEFAULT_BRAIN_URL).unwrap();
+
+        let written: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        // existing top-level key and sibling server are untouched
+        assert_eq!(written["model"], "haiku");
+        assert_eq!(written["mcpServers"]["other"]["command"], "x");
+        assert_eq!(written["mcpServers"]["cozby-brain"]["type"], "stdio");
+
+        let _ = fs::remove_file(&path);
     }
 
     fn write_external_plugin(root: &Path, name: &str, version: &str) {
@@ -3672,6 +4101,8 @@ mod tests {
         assert!(help.contains("/resume <session-path>"));
         assert!(help.contains("/config [env|hooks|model|plugins]"));
         assert!(help.contains("/mcp [list|show <server>|help]"));
+        assert!(help.contains("/brain [on [url]|off|status]"));
+        assert!(help.contains("/external [status]"));
         assert!(help.contains("/memory"));
         assert!(help.contains("/init"));
         assert!(help.contains("/diff"));
@@ -3685,7 +4116,7 @@ mod tests {
         assert!(help.contains("aliases: /plugins, /marketplace"));
         assert!(help.contains("/agents [list|help]"));
         assert!(help.contains("/skills [list|install <path>|help]"));
-        assert_eq!(slash_command_specs().len(), 141);
+        assert_eq!(slash_command_specs().len(), 143);
         assert!(resume_supported_slash_commands().len() >= 39);
     }
 

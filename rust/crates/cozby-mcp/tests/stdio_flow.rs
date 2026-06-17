@@ -157,6 +157,73 @@ async fn initialize_then_list_and_call_tools() {
 }
 
 #[tokio::test]
+async fn custom_contract_tool_is_advertised() {
+    let root = temp_dir("contract");
+    let contract = root.join("weather.toml");
+    fs::write(
+        &contract,
+        "name = \"weather\"\n\
+         base_url = \"https://api.weather.example\"\n\
+         [[tools]]\n\
+         name = \"forecast\"\n\
+         description = \"Get forecast\"\n\
+         method = \"GET\"\n\
+         path = \"/v1/forecast\"\n\
+         response = \"data\"\n\
+         [[tools.params]]\n\
+         name = \"city\"\n\
+         location = \"query\"\n\
+         required = true\n",
+    )
+    .unwrap();
+
+    let mut child = Command::new(binary_path())
+        .arg("--root")
+        .arg(&root)
+        .arg("--contract")
+        .arg(&contract)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn cozby-mcp");
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    write_frame(
+        &mut stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": { "protocolVersion": "2025-03-26", "capabilities": {} }
+        }),
+    )
+    .await;
+    let _ = timeout(TIMEOUT, read_frame(&mut stdout)).await.unwrap();
+
+    write_frame(
+        &mut stdin,
+        &json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }),
+    )
+    .await;
+    let response = timeout(TIMEOUT, read_frame(&mut stdout)).await.unwrap();
+    let tools = response["result"]["tools"].as_array().expect("tools array");
+    let forecast = tools
+        .iter()
+        .find(|tool| tool["name"] == "forecast")
+        .expect("custom contract tool advertised");
+    // GET contract tool → read-only, open-world; required param in schema.
+    assert_eq!(forecast["annotations"]["readOnlyHint"], true);
+    assert_eq!(forecast["annotations"]["openWorldHint"], true);
+    assert_eq!(forecast["inputSchema"]["required"][0], "city");
+
+    drop(stdin);
+    let _ = timeout(TIMEOUT, child.wait()).await;
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
 async fn unknown_method_returns_method_not_found() {
     let root = temp_dir("unknown-method");
 

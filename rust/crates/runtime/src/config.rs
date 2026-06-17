@@ -50,6 +50,23 @@ pub struct RuntimePluginConfig {
     bundled_root: Option<String>,
 }
 
+/// Optional "consult an external (more capable) model" integration.
+///
+/// Enterprise scenario: the internal model is primary and external models are
+/// generally off-limits, but for a few hard problems the agent may consult a
+/// stronger external model with sensitive identifiers anonymized first. This is
+/// inert unless `enabled` is true and `model`/`base_url`/`api_key_env` are set.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ExternalConsultConfig {
+    pub enabled: bool,
+    pub model: String,
+    pub base_url: String,
+    /// Name of the env var holding the external API key (never the key itself).
+    pub api_key_env: String,
+    /// Optional path for the local audit log of external requests.
+    pub audit_log: Option<String>,
+}
+
 /// Structured feature configuration consumed by runtime subsystems.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RuntimeFeatureConfig {
@@ -61,6 +78,7 @@ pub struct RuntimeFeatureConfig {
     permission_mode: Option<ResolvedPermissionMode>,
     permission_rules: RuntimePermissionRuleConfig,
     sandbox: SandboxConfig,
+    external_consult: Option<ExternalConsultConfig>,
 }
 
 /// Hook command lists grouped by lifecycle stage.
@@ -231,6 +249,10 @@ impl ConfigLoader {
             || PathBuf::from(".claw.json"),
             |parent| parent.join(".claw.json"),
         );
+        // Внутри каждого scope TOML идёт ПОСЛЕ JSON, поэтому при мердже
+        // TOML переопределяет JSON; межуровневый приоритет (user < project <
+        // local) сохраняется порядком блоков. `mcp.toml` — отдельный файл, где
+        // верхнеуровневые таблицы = MCP-серверы (http/stdio/любой транспорт).
         vec![
             ConfigEntry {
                 source: ConfigSource::User,
@@ -241,6 +263,14 @@ impl ConfigLoader {
                 path: self.config_home.join("settings.json"),
             },
             ConfigEntry {
+                source: ConfigSource::User,
+                path: self.config_home.join("settings.toml"),
+            },
+            ConfigEntry {
+                source: ConfigSource::User,
+                path: self.config_home.join("mcp.toml"),
+            },
+            ConfigEntry {
                 source: ConfigSource::Project,
                 path: self.cwd.join(".claw.json"),
             },
@@ -249,8 +279,20 @@ impl ConfigLoader {
                 path: self.cwd.join(".claw").join("settings.json"),
             },
             ConfigEntry {
+                source: ConfigSource::Project,
+                path: self.cwd.join(".claw").join("settings.toml"),
+            },
+            ConfigEntry {
+                source: ConfigSource::Project,
+                path: self.cwd.join(".claw").join("mcp.toml"),
+            },
+            ConfigEntry {
                 source: ConfigSource::Local,
                 path: self.cwd.join(".claw").join("settings.local.json"),
+            },
+            ConfigEntry {
+                source: ConfigSource::Local,
+                path: self.cwd.join(".claw").join("settings.local.toml"),
             },
         ]
     }
@@ -261,13 +303,31 @@ impl ConfigLoader {
         let mut mcp_servers = BTreeMap::new();
 
         for entry in self.discover() {
-            let Some(value) = read_optional_json_object(&entry.path)? else {
-                continue;
-            };
-            validate_optional_hooks_config(&value, &entry.path)?;
-            merge_mcp_servers(&mut mcp_servers, entry.source, &value, &entry.path)?;
-            deep_merge_objects(&mut merged, &value);
-            loaded_entries.push(entry);
+            match entry_kind(&entry.path) {
+                EntryKind::McpToml => {
+                    // Весь файл = карта серверов; оборачиваем в { mcpServers: … }.
+                    let Some(servers) = read_optional_toml_object(&entry.path)? else {
+                        continue;
+                    };
+                    let mut wrapper = BTreeMap::new();
+                    wrapper.insert("mcpServers".to_string(), JsonValue::Object(servers));
+                    merge_mcp_servers(&mut mcp_servers, entry.source, &wrapper, &entry.path)?;
+                    loaded_entries.push(entry);
+                }
+                kind => {
+                    let value = match kind {
+                        EntryKind::Toml => read_optional_toml_object(&entry.path)?,
+                        _ => read_optional_json_object(&entry.path)?,
+                    };
+                    let Some(value) = value else {
+                        continue;
+                    };
+                    validate_optional_hooks_config(&value, &entry.path)?;
+                    merge_mcp_servers(&mut mcp_servers, entry.source, &value, &entry.path)?;
+                    deep_merge_objects(&mut merged, &value);
+                    loaded_entries.push(entry);
+                }
+            }
         }
 
         let merged_value = JsonValue::Object(merged.clone());
@@ -283,6 +343,10 @@ impl ConfigLoader {
             permission_mode: parse_optional_permission_mode(&merged_value)?,
             permission_rules: parse_optional_permission_rules(&merged_value)?,
             sandbox: parse_optional_sandbox_config(&merged_value)?,
+            external_consult: parse_optional_external_consult(
+                &merged_value,
+                "merged settings.externalConsult",
+            )?,
         };
 
         Ok(RuntimeConfig {
@@ -354,6 +418,11 @@ impl RuntimeConfig {
     }
 
     #[must_use]
+    pub fn external_consult(&self) -> Option<&ExternalConsultConfig> {
+        self.feature_config.external_consult.as_ref()
+    }
+
+    #[must_use]
     pub fn permission_mode(&self) -> Option<ResolvedPermissionMode> {
         self.feature_config.permission_mode
     }
@@ -374,6 +443,11 @@ impl RuntimeFeatureConfig {
     pub fn with_hooks(mut self, hooks: RuntimeHookConfig) -> Self {
         self.hooks = hooks;
         self
+    }
+
+    #[must_use]
+    pub fn external_consult(&self) -> Option<&ExternalConsultConfig> {
+        self.external_consult.as_ref()
     }
 
     #[must_use]
@@ -569,6 +643,74 @@ impl McpServerConfig {
             Self::Sdk(_) => McpTransport::Sdk,
             Self::ManagedProxy(_) => McpTransport::ManagedProxy,
         }
+    }
+}
+
+/// Формат конфиг-файла, выводимый из имени/расширения.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EntryKind {
+    Json,
+    /// `settings.toml` — обычные настройки в TOML.
+    Toml,
+    /// `mcp.toml` — весь файл является картой MCP-серверов.
+    McpToml,
+}
+
+fn entry_kind(path: &Path) -> EntryKind {
+    let file_name = path.file_name().and_then(|name| name.to_str()).unwrap_or("");
+    if file_name == "mcp.toml" {
+        EntryKind::McpToml
+    } else if path.extension().and_then(|ext| ext.to_str()) == Some("toml") {
+        EntryKind::Toml
+    } else {
+        EntryKind::Json
+    }
+}
+
+/// Рекурсивно конвертирует `toml::Value` в наш `JsonValue`. Числа сводятся к
+/// `i64` (наш `JsonValue` хранит только целые — как и JSON-парсер крейта);
+/// даты сериализуются в строку.
+fn toml_to_json(value: &toml::Value) -> JsonValue {
+    match value {
+        toml::Value::String(text) => JsonValue::String(text.clone()),
+        toml::Value::Integer(number) => JsonValue::Number(*number),
+        #[allow(clippy::cast_possible_truncation)]
+        toml::Value::Float(number) => JsonValue::Number(*number as i64),
+        toml::Value::Boolean(flag) => JsonValue::Bool(*flag),
+        toml::Value::Datetime(datetime) => JsonValue::String(datetime.to_string()),
+        toml::Value::Array(items) => {
+            JsonValue::Array(items.iter().map(toml_to_json).collect())
+        }
+        toml::Value::Table(table) => {
+            let mut object = BTreeMap::new();
+            for (key, item) in table {
+                object.insert(key.clone(), toml_to_json(item));
+            }
+            JsonValue::Object(object)
+        }
+    }
+}
+
+/// Читает TOML-файл как объект (как [`read_optional_json_object`], но для TOML).
+fn read_optional_toml_object(
+    path: &Path,
+) -> Result<Option<BTreeMap<String, JsonValue>>, ConfigError> {
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(ConfigError::Io(error)),
+    };
+    if contents.trim().is_empty() {
+        return Ok(Some(BTreeMap::new()));
+    }
+    let parsed: toml::Value = toml::from_str(&contents)
+        .map_err(|error| ConfigError::Parse(format!("{}: {error}", path.display())))?;
+    match toml_to_json(&parsed) {
+        JsonValue::Object(object) => Ok(Some(object)),
+        _ => Err(ConfigError::Parse(format!(
+            "{}: top-level TOML value must be a table",
+            path.display()
+        ))),
     }
 }
 
@@ -809,6 +951,48 @@ fn parse_optional_oauth_config(
         callback_port,
         manual_redirect_url,
         scopes,
+    }))
+}
+
+fn parse_optional_external_consult(
+    root: &JsonValue,
+    context: &str,
+) -> Result<Option<ExternalConsultConfig>, ConfigError> {
+    let Some(value) = root
+        .as_object()
+        .and_then(|object| object.get("externalConsult"))
+    else {
+        return Ok(None);
+    };
+    let object = expect_object(value, context)?;
+    let enabled = optional_bool(object, "enabled", context)?.unwrap_or(false);
+    // Required only when enabled, so a disabled stub block stays valid.
+    let (model, base_url, api_key_env) = if enabled {
+        (
+            expect_string(object, "model", context)?.to_string(),
+            expect_string(object, "baseUrl", context)?.to_string(),
+            expect_string(object, "apiKeyEnv", context)?.to_string(),
+        )
+    } else {
+        (
+            optional_string(object, "model", context)?
+                .unwrap_or_default()
+                .to_string(),
+            optional_string(object, "baseUrl", context)?
+                .unwrap_or_default()
+                .to_string(),
+            optional_string(object, "apiKeyEnv", context)?
+                .unwrap_or_default()
+                .to_string(),
+        )
+    };
+    let audit_log = optional_string(object, "auditLog", context)?.map(str::to_string);
+    Ok(Some(ExternalConsultConfig {
+        enabled,
+        model,
+        base_url,
+        api_key_env,
+        audit_log,
     }))
 }
 
@@ -1085,14 +1269,123 @@ fn push_unique(target: &mut Vec<String>, value: String) {
 #[cfg(test)]
 mod tests {
     use super::{
-        deep_merge_objects, parse_permission_mode_label, ConfigLoader, ConfigSource,
-        McpServerConfig, McpTransport, ResolvedPermissionMode, RuntimeHookConfig,
-        RuntimePluginConfig, CLAW_SETTINGS_SCHEMA_NAME,
+        deep_merge_objects, parse_optional_external_consult, parse_permission_mode_label,
+        ConfigLoader, ConfigSource, McpServerConfig, McpTransport, ResolvedPermissionMode,
+        RuntimeHookConfig, RuntimePluginConfig, CLAW_SETTINGS_SCHEMA_NAME,
     };
     use crate::json::JsonValue;
     use crate::sandbox::FilesystemIsolationMode;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn external_consult_absent_is_none() {
+        let value = JsonValue::parse(r#"{ "model": "haiku" }"#).unwrap();
+        assert!(parse_optional_external_consult(&value, "ctx")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn external_consult_enabled_requires_fields() {
+        let value = JsonValue::parse(r#"{ "externalConsult": { "enabled": true } }"#).unwrap();
+        assert!(parse_optional_external_consult(&value, "ctx").is_err());
+    }
+
+    #[test]
+    fn external_consult_parses_full_block() {
+        let value = JsonValue::parse(
+            r#"{
+                "externalConsult": {
+                    "enabled": true,
+                    "model": "gpt-4o",
+                    "baseUrl": "https://gw.internal/v1",
+                    "apiKeyEnv": "EXT_LLM_KEY",
+                    "auditLog": ".claw/consult-audit.log"
+                }
+            }"#,
+        )
+        .unwrap();
+        let parsed = parse_optional_external_consult(&value, "ctx")
+            .unwrap()
+            .unwrap();
+        assert!(parsed.enabled);
+        assert_eq!(parsed.model, "gpt-4o");
+        assert_eq!(parsed.base_url, "https://gw.internal/v1");
+        assert_eq!(parsed.api_key_env, "EXT_LLM_KEY");
+        assert_eq!(parsed.audit_log.as_deref(), Some(".claw/consult-audit.log"));
+    }
+
+    #[test]
+    fn external_consult_disabled_stub_is_lenient() {
+        let value = JsonValue::parse(r#"{ "externalConsult": { "enabled": false } }"#).unwrap();
+        let parsed = parse_optional_external_consult(&value, "ctx")
+            .unwrap()
+            .unwrap();
+        assert!(!parsed.enabled);
+        assert!(parsed.model.is_empty());
+    }
+
+    #[test]
+    fn settings_toml_loads_and_overrides_json_in_same_scope() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(cwd.join(".claw")).expect("project dir");
+        fs::create_dir_all(&home).expect("home dir");
+
+        fs::write(home.join("settings.json"), r#"{"model":"json-model"}"#)
+            .expect("write json settings");
+        // TOML is discovered after JSON in the same scope → it wins.
+        fs::write(home.join("settings.toml"), "model = \"toml-model\"\n")
+            .expect("write toml settings");
+
+        let loaded = ConfigLoader::new(&cwd, &home).load().expect("load");
+        assert_eq!(loaded.model(), Some("toml-model"));
+    }
+
+    #[test]
+    fn mcp_toml_declares_http_and_stdio_servers() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(cwd.join(".claw")).expect("project dir");
+        fs::create_dir_all(&home).expect("home dir");
+
+        fs::write(
+            home.join("mcp.toml"),
+            "[myhttp]\ntype = \"http\"\nurl = \"https://gw.internal/mcp\"\n\n\
+             [mylocal]\ntype = \"stdio\"\ncommand = \"my-mcp\"\nargs = [\"--flag\"]\n",
+        )
+        .expect("write mcp.toml");
+
+        let loaded = ConfigLoader::new(&cwd, &home).load().expect("load");
+        let servers = loaded.mcp().servers();
+        assert_eq!(servers.len(), 2);
+        assert!(matches!(
+            servers.get("myhttp").map(|s| &s.config),
+            Some(super::McpServerConfig::Http(_))
+        ));
+        assert!(matches!(
+            servers.get("mylocal").map(|s| &s.config),
+            Some(super::McpServerConfig::Stdio(_))
+        ));
+    }
+
+    #[test]
+    fn toml_to_json_maps_scalars_arrays_tables() {
+        let value: toml::Value = toml::from_str(
+            "n = 7\nf = 1.5\nb = true\ns = \"x\"\narr = [1, 2]\n\n[t]\nk = \"v\"\n",
+        )
+        .unwrap();
+        let json = super::toml_to_json(&value);
+        let obj = json.as_object().unwrap();
+        assert_eq!(obj.get("n"), Some(&JsonValue::Number(7)));
+        assert_eq!(obj.get("f"), Some(&JsonValue::Number(1)));
+        assert_eq!(obj.get("b"), Some(&JsonValue::Bool(true)));
+        assert!(matches!(obj.get("arr"), Some(JsonValue::Array(_))));
+        assert!(matches!(obj.get("t"), Some(JsonValue::Object(_))));
+    }
 
     fn temp_dir() -> std::path::PathBuf {
         let nanos = SystemTime::now()

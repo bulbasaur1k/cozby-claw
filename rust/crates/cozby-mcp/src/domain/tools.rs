@@ -33,15 +33,17 @@ impl ToolKind {
     }
 }
 
-/// Транспортонезависимое описание инструмента. Инфраструктурный слой
-/// переводит его в `runtime::McpTool` без бизнес-логики.
+/// Транспортонезависимое описание файлового инструмента. Инфраструктурный слой
+/// переводит его в `runtime::McpTool`. Поле `name` — MCP-имя (`ToolKind::as_str`).
+///
+/// Инструменты внешних сервисов описываются не здесь, а контрактами
+/// ([`crate::domain::contract`]) и собираются в `McpTool` напрямую.
 #[derive(Debug, Clone)]
 pub struct ToolDescriptor {
-    pub kind: ToolKind,
+    pub name: &'static str,
     pub description: &'static str,
     pub input_schema: JsonValue,
-    /// MCP-аннотации, сигнализирующие клиенту, что все инструменты
-    /// строго read-only и не ходят в сеть.
+    /// MCP-аннотации файловых инструментов: строго read-only и closed-world.
     pub annotations: JsonValue,
 }
 
@@ -55,7 +57,7 @@ pub fn tool_descriptors() -> Vec<ToolDescriptor> {
 
     vec![
         ToolDescriptor {
-            kind: ToolKind::ReadFile,
+            name: ToolKind::ReadFile.as_str(),
             description: "Read a UTF-8 text file inside --root. Returns up to 256 KiB of \
                           content. Paths are resolved relative to --root and rejected if \
                           they escape it.",
@@ -69,7 +71,7 @@ pub fn tool_descriptors() -> Vec<ToolDescriptor> {
             annotations: safe_annotations.clone(),
         },
         ToolDescriptor {
-            kind: ToolKind::ListDir,
+            name: ToolKind::ListDir.as_str(),
             description: "List entries of a directory inside --root. Returns name + kind \
                           for each entry.",
             input_schema: json!({
@@ -84,7 +86,7 @@ pub fn tool_descriptors() -> Vec<ToolDescriptor> {
             annotations: safe_annotations.clone(),
         },
         ToolDescriptor {
-            kind: ToolKind::Glob,
+            name: ToolKind::Glob.as_str(),
             description: "Glob-match files relative to --root. Returns a list of matching \
                           relative paths.",
             input_schema: json!({
@@ -97,7 +99,7 @@ pub fn tool_descriptors() -> Vec<ToolDescriptor> {
             annotations: safe_annotations.clone(),
         },
         ToolDescriptor {
-            kind: ToolKind::Grep,
+            name: ToolKind::Grep.as_str(),
             description: "Regex-search inside --root. Returns at most 500 matches formatted \
                           as path:line: text.",
             input_schema: json!({
@@ -152,9 +154,9 @@ mod tests {
     #[test]
     fn required_fields_are_declared_for_read_file_and_glob_and_grep() {
         let descriptors = tool_descriptors();
-        let find = |k: ToolKind| descriptors.iter().find(|d| d.kind == k).unwrap();
-        assert_eq!(find(ToolKind::ReadFile).input_schema["required"][0], "path");
-        assert_eq!(find(ToolKind::Glob).input_schema["required"][0], "pattern");
-        assert_eq!(find(ToolKind::Grep).input_schema["required"][0], "pattern");
+        let find = |name: &str| descriptors.iter().find(|d| d.name == name).unwrap();
+        assert_eq!(find("read_file").input_schema["required"][0], "path");
+        assert_eq!(find("glob").input_schema["required"][0], "pattern");
+        assert_eq!(find("grep").input_schema["required"][0], "pattern");
     }
 }

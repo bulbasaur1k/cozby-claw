@@ -405,6 +405,35 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             required_permission: PermissionMode::DangerFullAccess,
         },
         ToolSpec {
+            name: "consult_external_model",
+            description: "Ask a more capable EXTERNAL model for help with a hard problem when \
+                          the internal model is stuck. Only available when external consultation \
+                          is configured. Before anything is sent, identifiers that may carry \
+                          project/company names (namespaces, module paths, type/class names) are \
+                          anonymized and the user must review and approve the exact payload. The \
+                          answer comes back with real names restored. Do NOT include secrets, \
+                          credentials, or customer data — only the minimal code/question needed.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "question": {
+                        "type": "string",
+                        "description": "The specific question for the external model."
+                    },
+                    "context": {
+                        "type": "string",
+                        "description": "Optional minimal code/snippets needed to answer (will be anonymized)."
+                    }
+                },
+                "required": ["question"],
+                "additionalProperties": false
+            }),
+            // Сетевой egress, но обязательное ревью обеспечивает сам инструмент,
+            // а не permission-режим — поэтому ReadOnly (всегда исполняется, далее
+            // спрашивает пользователя интерактивно перед отправкой).
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
             name: "read_file",
             description: "Read a text file from the workspace.",
             input_schema: json!({
@@ -4934,6 +4963,7 @@ fn parse_skill_description(contents: &str) -> Option<String> {
 }
 
 pub mod lane_completion;
+pub mod external_consult;
 
 #[cfg(test)]
 mod tests {

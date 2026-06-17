@@ -31,4 +31,17 @@ pub enum DomainError {
 
     #[error("filesystem error: {0}")]
     Filesystem(String),
+
+    /// Обязательное поле tool-call'а отсутствует (динамическое имя — в отличие
+    /// от статического [`Self::MissingArgument`], используется контрактами).
+    #[error("missing required field: {0}")]
+    MissingField(String),
+
+    /// Сетевой сбой / не-2xx / `{ "error": ... }` при вызове HTTP-контракта.
+    #[error("http contract error: {0}")]
+    Http(String),
+
+    /// Ошибка загрузки/разбора файла контракта.
+    #[error("contract error: {0}")]
+    Contract(String),
 }

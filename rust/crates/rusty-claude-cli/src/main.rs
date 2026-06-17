@@ -13,7 +13,7 @@ mod render;
 use std::collections::BTreeSet;
 use std::env;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::net::TcpListener;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
@@ -25,14 +25,16 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use api::{
     resolve_startup_auth_source, AnthropicClient, AuthSource, ContentBlockDelta, InputContentBlock,
-    InputMessage, MessageRequest, MessageResponse, OutputContentBlock, PromptCache,
-    StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
+    InputMessage, MessageRequest, MessageResponse, OpenAiCompatClient, OpenAiCompatConfig,
+    OutputContentBlock, PromptCache, StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition,
+    ToolResultContentBlock,
 };
 
 use commands::{
-    handle_agents_slash_command, handle_mcp_slash_command, handle_plugins_slash_command,
-    handle_skills_slash_command, render_slash_command_help, resume_supported_slash_commands,
-    slash_command_specs, validate_slash_command_input, SlashCommand,
+    handle_agents_slash_command, handle_brain_slash_command, handle_external_slash_command,
+    handle_mcp_slash_command, handle_plugins_slash_command, handle_skills_slash_command,
+    render_slash_command_help, resume_supported_slash_commands, slash_command_specs,
+    validate_slash_command_input, SlashCommand,
 };
 use compat_harness::{extract_manifest, UpstreamPaths};
 use init::initialize_repo;
@@ -42,15 +44,15 @@ use runtime::{
     clear_oauth_credentials, format_usd, generate_pkce_pair, generate_state, load_system_prompt,
     parse_oauth_callback_request_target, pricing_for_model, resolve_sandbox_status,
     save_oauth_credentials, ApiClient, ApiRequest, AssistantEvent, CompactionConfig, ConfigLoader,
-    ConfigSource, ContentBlock, ConversationMessage, ConversationRuntime, McpServerManager,
-    McpTool, MessageRole, ModelPricing, OAuthAuthorizationRequest, OAuthConfig,
+    ConfigSource, ContentBlock, ConversationMessage, ConversationRuntime, ExternalConsultConfig,
+    McpServerManager, McpTool, MessageRole, ModelPricing, OAuthAuthorizationRequest, OAuthConfig,
     OAuthTokenExchangeRequest, PermissionMode, PermissionPolicy, ProjectContext, PromptCacheEvent,
     ResolvedPermissionMode, RuntimeError, Session, TokenUsage, ToolError, ToolExecutor,
     UsageTracker,
 };
 use serde::Deserialize;
 use serde_json::json;
-use tools::{GlobalToolRegistry, RuntimeToolDefinition, ToolSearchOutput};
+use tools::{external_consult::Anonymizer, GlobalToolRegistry, RuntimeToolDefinition, ToolSearchOutput};
 
 const DEFAULT_MODEL: &str = "claude-opus-4-6";
 fn max_tokens_for_model(model: &str) -> u32 {
@@ -111,6 +113,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         CliAction::BootstrapPlan => print_bootstrap_plan(),
         CliAction::Agents { args } => LiveCli::print_agents(args.as_deref())?,
         CliAction::Mcp { args } => LiveCli::print_mcp(args.as_deref())?,
+        CliAction::Brain { args } => LiveCli::print_brain(args.as_deref())?,
+        CliAction::External { args } => LiveCli::print_external(args.as_deref())?,
         CliAction::Skills { args } => LiveCli::print_skills(args.as_deref())?,
         CliAction::PrintSystemPrompt { cwd, date } => print_system_prompt(cwd, date),
         CliAction::Version => print_version(),
@@ -155,6 +159,12 @@ enum CliAction {
         args: Option<String>,
     },
     Mcp {
+        args: Option<String>,
+    },
+    Brain {
+        args: Option<String>,
+    },
+    External {
         args: Option<String>,
     },
     Skills {
@@ -363,6 +373,12 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         "mcp" => Ok(CliAction::Mcp {
             args: join_optional_args(&rest[1..]),
         }),
+        "brain" => Ok(CliAction::Brain {
+            args: join_optional_args(&rest[1..]),
+        }),
+        "external" => Ok(CliAction::External {
+            args: join_optional_args(&rest[1..]),
+        }),
         "skills" => Ok(CliAction::Skills {
             args: join_optional_args(&rest[1..]),
         }),
@@ -468,6 +484,15 @@ fn parse_direct_slash_cli_action(rest: &[String]) -> Result<CliAction, String> {
                 (None, Some(target)) => Some(target),
             },
         }),
+        Ok(Some(SlashCommand::Brain { action, target })) => Ok(CliAction::Brain {
+            args: match (action, target) {
+                (None, None) => None,
+                (Some(action), None) => Some(action),
+                (Some(action), Some(target)) => Some(format!("{action} {target}")),
+                (None, Some(target)) => Some(target),
+            },
+        }),
+        Ok(Some(SlashCommand::External { action })) => Ok(CliAction::External { args: action }),
         Ok(Some(SlashCommand::Skills { args })) => Ok(CliAction::Skills { args }),
         Ok(Some(SlashCommand::Unknown(name))) => Err(format_unknown_direct_slash_command(&name)),
         Ok(Some(command)) => Err({
@@ -1641,6 +1666,26 @@ fn run_resume_command(
                 message: Some(handle_mcp_slash_command(args.as_deref(), &cwd)?),
             })
         }
+        SlashCommand::Brain { action, target } => {
+            let cwd = env::current_dir()?;
+            let args = match (action.as_deref(), target.as_deref()) {
+                (None, None) => None,
+                (Some(action), None) => Some(action.to_string()),
+                (Some(action), Some(target)) => Some(format!("{action} {target}")),
+                (None, Some(target)) => Some(target.to_string()),
+            };
+            Ok(ResumeCommandOutcome {
+                session: session.clone(),
+                message: Some(handle_brain_slash_command(args.as_deref(), &cwd)?),
+            })
+        }
+        SlashCommand::External { action } => {
+            let cwd = env::current_dir()?;
+            Ok(ResumeCommandOutcome {
+                session: session.clone(),
+                message: Some(handle_external_slash_command(action.as_deref(), &cwd)?),
+            })
+        }
         SlashCommand::Memory => Ok(ResumeCommandOutcome {
             session: session.clone(),
             message: Some(render_memory_report()?),
@@ -2571,6 +2616,20 @@ impl LiveCli {
                 Self::print_mcp(args.as_deref())?;
                 false
             }
+            SlashCommand::Brain { action, target } => {
+                let args = match (action.as_deref(), target.as_deref()) {
+                    (None, None) => None,
+                    (Some(action), None) => Some(action.to_string()),
+                    (Some(action), Some(target)) => Some(format!("{action} {target}")),
+                    (None, Some(target)) => Some(target.to_string()),
+                };
+                Self::print_brain(args.as_deref())?;
+                false
+            }
+            SlashCommand::External { action } => {
+                Self::print_external(action.as_deref())?;
+                false
+            }
             SlashCommand::Memory => {
                 Self::print_memory()?;
                 false
@@ -2886,6 +2945,18 @@ impl LiveCli {
     fn print_mcp(args: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
         let cwd = env::current_dir()?;
         println!("{}", handle_mcp_slash_command(args, &cwd)?);
+        Ok(())
+    }
+
+    fn print_brain(args: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+        let cwd = env::current_dir()?;
+        println!("{}", handle_brain_slash_command(args, &cwd)?);
+        Ok(())
+    }
+
+    fn print_external(args: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+        let cwd = env::current_dir()?;
+        println!("{}", handle_external_slash_command(args, &cwd)?);
         Ok(())
     }
 
@@ -4893,6 +4964,10 @@ fn build_runtime_with_plugin_state(
     plugin_registry.initialize()?;
     let policy = permission_policy(permission_mode, &feature_config, &tool_registry)
         .map_err(std::io::Error::other)?;
+    // External-model consultation is opt-in: present only when enabled in config
+    // and the API key env var is set. When absent the tool is neither offered to
+    // the model nor executable, and the internal model stays the only model.
+    let external_consult = ExternalConsultRuntime::from_config(feature_config.external_consult());
     let mut runtime = ConversationRuntime::new_with_features(
         session,
         AnthropicRuntimeClient::new(
@@ -4903,12 +4978,14 @@ fn build_runtime_with_plugin_state(
             allowed_tools.clone(),
             tool_registry.clone(),
             progress_reporter,
+            external_consult.is_some(),
         )?,
         CliToolExecutor::new(
             allowed_tools.clone(),
             emit_output,
             tool_registry.clone(),
             mcp_state.clone(),
+            external_consult,
         ),
         policy,
         system_prompt,
@@ -5011,6 +5088,8 @@ struct AnthropicRuntimeClient {
     allowed_tools: Option<AllowedToolSet>,
     tool_registry: GlobalToolRegistry,
     progress_reporter: Option<InternalPromptProgressReporter>,
+    /// Whether the external-consult tool should be advertised to the model.
+    external_consult_enabled: bool,
 }
 
 impl AnthropicRuntimeClient {
@@ -5022,6 +5101,7 @@ impl AnthropicRuntimeClient {
         allowed_tools: Option<AllowedToolSet>,
         tool_registry: GlobalToolRegistry,
         progress_reporter: Option<InternalPromptProgressReporter>,
+        external_consult_enabled: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         Ok(Self {
             runtime: tokio::runtime::Runtime::new()?,
@@ -5034,6 +5114,7 @@ impl AnthropicRuntimeClient {
             allowed_tools,
             tool_registry,
             progress_reporter,
+            external_consult_enabled,
         })
     }
 }
@@ -5059,9 +5140,15 @@ impl ApiClient for AnthropicRuntimeClient {
             max_tokens: max_tokens_for_model(&self.model),
             messages: convert_messages(&request.messages),
             system: (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n")),
-            tools: self
-                .enable_tools
-                .then(|| filter_tool_specs(&self.tool_registry, self.allowed_tools.as_ref())),
+            tools: self.enable_tools.then(|| {
+                let mut tools = filter_tool_specs(&self.tool_registry, self.allowed_tools.as_ref());
+                // Only advertise external consultation when it is actually
+                // configured; otherwise the model must not see the tool.
+                if !self.external_consult_enabled {
+                    tools.retain(|tool| tool.name != "consult_external_model");
+                }
+                tools
+            }),
             tool_choice: self.enable_tools.then_some(ToolChoice::Auto),
             stream: true,
         };
@@ -5851,12 +5938,190 @@ fn prompt_cache_record_to_runtime_event(
     })
 }
 
+/// Resolved external-consult capability: the configured external model plus
+/// the API key read from the environment. Present only when the feature is
+/// enabled AND the key env var is set, so the tool is offered solely when it
+/// can actually run. The internal model always stays primary.
+#[derive(Clone)]
+struct ExternalConsultRuntime {
+    config: ExternalConsultConfig,
+    api_key: String,
+}
+
+impl ExternalConsultRuntime {
+    /// Builds the runtime if the feature is enabled and the API key env var is
+    /// populated; otherwise `None` (feature stays off / unadvertised).
+    fn from_config(config: Option<&ExternalConsultConfig>) -> Option<Self> {
+        let config = config?;
+        if !config.enabled {
+            return None;
+        }
+        let api_key = env::var(&config.api_key_env)
+            .ok()
+            .filter(|key| !key.trim().is_empty())?;
+        Some(Self {
+            config: config.clone(),
+            api_key,
+        })
+    }
+
+    fn audit_path(&self) -> PathBuf {
+        self.config.audit_log.as_ref().map_or_else(
+            || PathBuf::from(".claw").join("external-consult-audit.log"),
+            PathBuf::from,
+        )
+    }
+
+    /// Anonymize → review → send → de-anonymize → audit. Returns the answer
+    /// with real identifiers restored, or a declined/error message.
+    fn run(&self, question: &str, context: Option<&str>) -> Result<String, ToolError> {
+        // 1. Anonymize question + context with one shared, reversible mapping.
+        let mut anon = Anonymizer::new();
+        let safe_question = anon.anonymize(question);
+        let safe_context = context.map(|ctx| anon.anonymize(ctx));
+        let payload = match &safe_context {
+            Some(ctx) => format!("{safe_question}\n\nContext:\n{ctx}"),
+            None => safe_question.clone(),
+        };
+
+        // 2. Mandatory review. Without an interactive terminal we cannot show
+        //    the payload to a human, so we refuse to send (fail closed).
+        if !io::stdin().is_terminal() {
+            self.audit("declined-noninteractive", &payload, anon.redactions().len());
+            return Ok(
+                "External consultation skipped: no interactive terminal to review the \
+                 outgoing payload (required before any data leaves for an external model)."
+                    .to_string(),
+            );
+        }
+        if !self.review_and_confirm(&payload, &anon)? {
+            self.audit("declined", &payload, anon.redactions().len());
+            return Ok("External consultation declined by user; nothing was sent.".to_string());
+        }
+
+        // 3. Send the anonymized payload to the external model.
+        let answer = self.send(&payload)?;
+        self.audit("sent", &payload, anon.redactions().len());
+
+        // 4. Restore the real identifiers in the model's answer.
+        Ok(anon.deanonymize(&answer))
+    }
+
+    /// Renders the exact outgoing payload + redaction legend and asks y/N.
+    fn review_and_confirm(&self, payload: &str, anon: &Anonymizer) -> Result<bool, ToolError> {
+        let mut out = io::stdout();
+        writeln!(out, "\n── External model consultation review ──").ok();
+        writeln!(out, "  model      {}", self.config.model).ok();
+        writeln!(out, "  endpoint   {}", self.config.base_url).ok();
+        let redactions = anon.redactions();
+        if redactions.is_empty() {
+            writeln!(out, "  redactions none").ok();
+        } else {
+            writeln!(out, "  redactions {} (placeholder ← real):", redactions.len()).ok();
+            for (placeholder, real) in &redactions {
+                writeln!(out, "      {placeholder} ← {real}").ok();
+            }
+        }
+        writeln!(out, "  ── payload to be sent (anonymized) ──").ok();
+        for line in payload.lines() {
+            writeln!(out, "  | {line}").ok();
+        }
+        write!(out, "Send this to the external model? [y/N]: ").ok();
+        out.flush().ok();
+
+        let mut response = String::new();
+        io::stdin()
+            .read_line(&mut response)
+            .map_err(|error| ToolError::new(format!("failed to read review response: {error}")))?;
+        Ok(matches!(
+            response.trim().to_ascii_lowercase().as_str(),
+            "y" | "yes"
+        ))
+    }
+
+    /// Blocking call to the external (OpenAI-compatible) endpoint.
+    fn send(&self, payload: &str) -> Result<String, ToolError> {
+        let request = MessageRequest {
+            model: self.config.model.clone(),
+            max_tokens: 2048,
+            messages: vec![InputMessage::user_text(payload.to_string())],
+            system: Some(
+                "You are a senior engineering assistant. Identifiers in the user's code have \
+                 been anonymized (types as T_1/T_2…, namespaces as N_1/N_2…) to protect \
+                 proprietary names. Treat them as opaque and reuse the same placeholders \
+                 verbatim in your answer."
+                    .to_string(),
+            ),
+            tools: None,
+            tool_choice: None,
+            stream: false,
+        };
+        let client = OpenAiCompatClient::new(self.api_key.clone(), OpenAiCompatConfig::openai())
+            .with_base_url(self.config.base_url.clone());
+        let tokio_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| ToolError::new(format!("failed to start async runtime: {error}")))?;
+        let response = tokio_runtime
+            .block_on(async { client.send_message(&request).await })
+            .map_err(|error| ToolError::new(format!("external model request failed: {error}")))?;
+        let answer = response
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                OutputContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if answer.trim().is_empty() {
+            return Err(ToolError::new("external model returned an empty response"));
+        }
+        Ok(answer)
+    }
+
+    /// Appends one JSON line to the local audit log. Best-effort: a logging
+    /// failure must not block the answer, so errors are swallowed (reported to
+    /// stderr only).
+    fn audit(&self, decision: &str, payload: &str, redactions: usize) {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let record = json!({
+            "ts_unix": ts,
+            "decision": decision,
+            "model": self.config.model,
+            "base_url": self.config.base_url,
+            "redactions": redactions,
+            "payload": payload,
+        });
+        let path = self.audit_path();
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let line = format!("{record}\n");
+        if let Err(error) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .and_then(|mut file| file.write_all(line.as_bytes()))
+        {
+            eprintln!(
+                "cozby-claw: failed to write external-consult audit log {}: {error}",
+                path.display()
+            );
+        }
+    }
+}
+
 struct CliToolExecutor {
     renderer: TerminalRenderer,
     emit_output: bool,
     allowed_tools: Option<AllowedToolSet>,
     tool_registry: GlobalToolRegistry,
     mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
+    external_consult: Option<ExternalConsultRuntime>,
 }
 
 impl CliToolExecutor {
@@ -5865,6 +6130,7 @@ impl CliToolExecutor {
         emit_output: bool,
         tool_registry: GlobalToolRegistry,
         mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
+        external_consult: Option<ExternalConsultRuntime>,
     ) -> Self {
         Self {
             renderer: TerminalRenderer::new(),
@@ -5872,7 +6138,26 @@ impl CliToolExecutor {
             allowed_tools,
             tool_registry,
             mcp_state,
+            external_consult,
         }
+    }
+
+    fn run_external_consult(&self, value: serde_json::Value) -> Result<String, ToolError> {
+        let Some(consult) = &self.external_consult else {
+            return Err(ToolError::new(
+                "external model consultation is not enabled; configure `externalConsult` in \
+                 settings.json (see /external) and set the API key env var",
+            ));
+        };
+        #[derive(Deserialize)]
+        struct ConsultRequest {
+            question: String,
+            #[serde(default)]
+            context: Option<String>,
+        }
+        let request: ConsultRequest = serde_json::from_value(value)
+            .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
+        consult.run(&request.question, request.context.as_deref())
     }
 
     fn execute_search_tool(&self, value: serde_json::Value) -> Result<String, ToolError> {
@@ -5952,7 +6237,9 @@ impl ToolExecutor for CliToolExecutor {
         }
         let value = serde_json::from_str(input)
             .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
-        let result = if tool_name == "ToolSearch" {
+        let result = if tool_name == "consult_external_model" {
+            self.run_external_consult(value)
+        } else if tool_name == "ToolSearch" {
             self.execute_search_tool(value)
         } else if self.tool_registry.has_runtime_tool(tool_name) {
             self.execute_runtime_tool(tool_name, value)
@@ -6217,6 +6504,67 @@ mod tests {
     use std::sync::{Mutex, MutexGuard, OnceLock};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tools::GlobalToolRegistry;
+
+    #[test]
+    fn external_consult_from_config_requires_enabled_and_key() {
+        use super::ExternalConsultRuntime;
+        use runtime::ExternalConsultConfig;
+
+        // Disabled → None even with everything else present.
+        let disabled = ExternalConsultConfig {
+            enabled: false,
+            model: "m".to_string(),
+            base_url: "http://x".to_string(),
+            api_key_env: "CLAW_TEST_CONSULT_KEY_ABSENT".to_string(),
+            audit_log: None,
+        };
+        assert!(ExternalConsultRuntime::from_config(Some(&disabled)).is_none());
+
+        // Enabled but the API key env var is unset → None (not advertised).
+        let enabled_no_key = ExternalConsultConfig {
+            enabled: true,
+            api_key_env: "CLAW_TEST_CONSULT_KEY_ABSENT".to_string(),
+            ..disabled.clone()
+        };
+        assert!(ExternalConsultRuntime::from_config(Some(&enabled_no_key)).is_none());
+        assert!(ExternalConsultRuntime::from_config(None).is_none());
+    }
+
+    #[test]
+    fn external_consult_non_interactive_fails_closed_and_audits_anonymized() {
+        use super::ExternalConsultRuntime;
+        use runtime::ExternalConsultConfig;
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let audit = std::env::temp_dir().join(format!("claw-consult-audit-{nanos}.log"));
+        let consult = ExternalConsultRuntime {
+            config: ExternalConsultConfig {
+                enabled: true,
+                model: "external-big".to_string(),
+                base_url: "http://localhost:1/v1".to_string(),
+                api_key_env: "X".to_string(),
+                audit_log: Some(audit.display().to_string()),
+            },
+            api_key: "dummy".to_string(),
+        };
+
+        // Under `cargo test` stdin is not a TTY → must NOT send; returns a skip
+        // message and never touches the network (base_url is unroutable).
+        let out = consult
+            .run("How does acme::billing::InvoiceService charge work?", None)
+            .expect("non-interactive run returns a message, not an error");
+        assert!(out.contains("no interactive terminal"), "got: {out}");
+
+        let log = fs::read_to_string(&audit).expect("audit log written");
+        assert!(log.contains("declined-noninteractive"), "log: {log}");
+        // The audit log stores only the ANONYMIZED payload — real names absent.
+        assert!(!log.contains("acme"), "real namespace leaked into audit: {log}");
+        assert!(!log.contains("InvoiceService"), "real type leaked: {log}");
+        let _ = fs::remove_file(&audit);
+    }
 
     fn registry_with_plugin_tool() -> GlobalToolRegistry {
         GlobalToolRegistry::with_plugin_tools(vec![PluginTool::new(
@@ -8245,6 +8593,7 @@ UU conflicted.rs",
             false,
             state.tool_registry.clone(),
             state.mcp_state.clone(),
+            None,
         );
 
         let tool_output = executor
@@ -8343,6 +8692,7 @@ UU conflicted.rs",
             false,
             state.tool_registry.clone(),
             state.mcp_state.clone(),
+            None,
         );
 
         let search_output = executor

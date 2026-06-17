@@ -4,4 +4,4 @@
 pub mod ports;
 pub mod use_cases;
 
-pub use ports::{DirEntry, DirEntryKind, FileSystem, ReadOutcome};
+pub use ports::{DirEntry, DirEntryKind, FileSystem, HttpTransport, ReadOutcome};

@@ -1,6 +1,8 @@
 use std::path::{Path, PathBuf};
 
-use crate::domain::DomainError;
+use serde_json::Value as JsonValue;
+
+use crate::domain::{DomainError, HttpMethod};
 
 /// Тип элемента каталога, возвращаемый `FileSystem::list_dir`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,4 +63,23 @@ pub trait FileSystem: Send + Sync {
 
     /// Рекурсивный обход, не следуя символическим ссылкам.
     fn walk_files(&self, root: &Path) -> Result<Vec<PathBuf>, DomainError>;
+}
+
+/// Транспорт для HTTP-контрактов — единственный сетевой порт. Реализуется в
+/// infrastructure (`ReqwestTransport`); use-case'ы знают только этот trait,
+/// что позволяет тестировать `dispatch_contract` на мок-транспорте без сети.
+///
+/// Метод синхронный: stdio-сервер обрабатывает запросы последовательно, и
+/// blocking-HTTP здесь уместен (адаптер сам уводит вызов на отдельный поток).
+pub trait HttpTransport: Send + Sync {
+    /// Выполняет запрос и возвращает распарсенное JSON-тело ответа. Сетевые
+    /// сбои / не-2xx приводятся к [`DomainError::Http`].
+    fn send(
+        &self,
+        method: HttpMethod,
+        url: &str,
+        query: &[(String, String)],
+        headers: &[(String, String)],
+        body: Option<&JsonValue>,
+    ) -> Result<JsonValue, DomainError>;
 }

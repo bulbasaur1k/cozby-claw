@@ -6,18 +6,27 @@ use std::env;
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use cozby_mcp::{parse_args, wire_server, Args, ConfigError, StdFileSystem};
+use cozby_mcp::application::ports::HttpTransport;
+use cozby_mcp::domain::Contract;
+use cozby_mcp::{
+    builtin_brain_contract, load_contract_file, parse_args, wire_server, Args, ConfigError,
+    ReqwestTransport, StdFileSystem,
+};
 
 const HELP: &str = "\
-cozby-mcp — MCP stdio server (read-only, root-scoped filesystem tools)
+cozby-mcp — MCP stdio server: read-only filesystem tools + HTTP contracts
 
 USAGE:
-    cozby-mcp [--root <dir>]
+    cozby-mcp [--root <dir>] [--brain-url <url>] [--contract <file.toml> ...]
 
 OPTIONS:
-    --root <dir>   Restrict tool access to this directory (default: cwd)
-    -h, --help     Print help
-    -V, --version  Print version
+    --root <dir>        Restrict filesystem tool access to this directory (default: cwd)
+    --brain-url <url>   Attach the built-in cozby-brain contract (save_note, search_notes,
+                        save_doc, recall). Falls back to env COZBY_BRAIN_URL.
+    --contract <file>   Attach a TOML contract describing an HTTP service as MCP tools.
+                        Repeatable. Falls back to env COZBY_MCP_CONTRACTS (':'-separated).
+    -h, --help          Print help
+    -V, --version       Print version
 ";
 
 fn main() -> ExitCode {
@@ -54,7 +63,33 @@ fn run(args: Args) -> ExitCode {
     };
 
     let fs = Arc::new(StdFileSystem::new());
-    let mut server = wire_server(args, fs);
+
+    // Транспорт строим здесь, до входа в async-рантайм: blocking-reqwest не
+    // должен инициализироваться внутри tokio-контекста.
+    let transport: Arc<dyn HttpTransport> = match ReqwestTransport::new() {
+        Ok(transport) => Arc::new(transport),
+        Err(error) => {
+            eprintln!("cozby-mcp: cannot build HTTP transport: {error}");
+            return ExitCode::from(1);
+        }
+    };
+
+    // Собираем контракты: встроенный brain (если задан --brain-url) + файлы.
+    let mut contracts: Vec<Contract> = Vec::new();
+    if let Some(url) = &args.brain_url {
+        contracts.push(builtin_brain_contract(url.clone()));
+    }
+    for path in &args.contracts {
+        match load_contract_file(path) {
+            Ok(contract) => contracts.push(contract),
+            Err(error) => {
+                eprintln!("cozby-mcp: {error}");
+                return ExitCode::from(1);
+            }
+        }
+    }
+
+    let mut server = wire_server(args, fs, transport, contracts);
     match runtime.block_on(async move { server.run().await }) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {

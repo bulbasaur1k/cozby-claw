@@ -18,4 +18,7 @@ pub mod domain;
 pub mod infrastructure;
 
 pub use bootstrap::{assemble_spec, wire_server};
-pub use infrastructure::{parse_args, Args, ConfigError, StdFileSystem};
+pub use infrastructure::{
+    builtin_brain_contract, load_contract_file, parse_args, Args, ConfigError, ReqwestTransport,
+    StdFileSystem,
+};
