@@ -611,7 +611,10 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "required": ["description", "prompt"],
                 "additionalProperties": false
             }),
-            required_permission: PermissionMode::DangerFullAccess,
+            // Запуск под-агента — это запрос к ОСНОВНОЙ модели (локальной/дешёвой),
+            // поэтому не требует подтверждения. Платная «внешняя» модель гейтится
+            // отдельно (`consult_external_model` со своим обязательным ревью).
+            required_permission: PermissionMode::ReadOnly,
         },
         ToolSpec {
             name: "ToolSearch",

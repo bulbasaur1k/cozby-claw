@@ -362,6 +362,14 @@ impl StreamState {
         }
 
         for choice in chunk.choices {
+            // Reasoning-токены (Qwen3 / OpenRouter) отдаём как ThinkingDelta —
+            // вне основного текстового блока, чтобы клиент показал их отдельно.
+            if let Some(reasoning) = choice.delta.reasoning.filter(|value| !value.is_empty()) {
+                events.push(StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+                    index: 0,
+                    delta: ContentBlockDelta::ThinkingDelta { thinking: reasoning },
+                }));
+            }
             if let Some(content) = choice.delta.content.filter(|value| !value.is_empty()) {
                 if !self.text_started {
                     self.text_started = true;
@@ -604,6 +612,10 @@ struct ChunkChoice {
 struct ChunkDelta {
     #[serde(default)]
     content: Option<String>,
+    /// Reasoning/thinking trace (OpenRouter / Qwen3 extension); surfaced as a
+    /// `ThinkingDelta` so clients can render it separately.
+    #[serde(default)]
+    reasoning: Option<String>,
     #[serde(default)]
     tool_calls: Vec<DeltaToolCall>,
 }
@@ -694,11 +706,19 @@ fn translate_message(message: &InputMessage) -> Vec<Value> {
             if text.is_empty() && tool_calls.is_empty() {
                 Vec::new()
             } else {
-                vec![json!({
-                    "role": "assistant",
-                    "content": (!text.is_empty()).then_some(text),
-                    "tool_calls": tool_calls,
-                })]
+                // `tool_calls` опускаем, когда вызовов нет: часть провайдеров
+                // (Alibaba/qwen) отвергает пустой массив "Empty tool_calls is not
+                // supported in message", тогда как OpenAI его терпит.
+                let mut message = serde_json::Map::new();
+                message.insert("role".to_string(), json!("assistant"));
+                message.insert(
+                    "content".to_string(),
+                    json!((!text.is_empty()).then_some(text)),
+                );
+                if !tool_calls.is_empty() {
+                    message.insert("tool_calls".to_string(), json!(tool_calls));
+                }
+                vec![Value::Object(message)]
             }
         }
         _ => message
@@ -1003,6 +1023,63 @@ mod tests {
     }
 
     #[test]
+    fn assistant_text_message_omits_empty_tool_calls() {
+        // Регрессия: Alibaba/qwen отвергают пустой `tool_calls: []` в сообщении.
+        let payload = build_chat_completion_request(
+            &MessageRequest {
+                model: "qwen".to_string(),
+                max_tokens: 64,
+                messages: vec![
+                    InputMessage::user_text("hi"),
+                    InputMessage {
+                        role: "assistant".to_string(),
+                        content: vec![InputContentBlock::Text {
+                            text: "hello there".to_string(),
+                        }],
+                    },
+                ],
+                system: None,
+                tools: None,
+                tool_choice: None,
+                stream: false,
+            },
+            OpenAiCompatConfig::openai(),
+        );
+        let assistant = &payload["messages"][1];
+        assert_eq!(assistant["role"], json!("assistant"));
+        assert_eq!(assistant["content"], json!("hello there"));
+        assert!(
+            assistant.get("tool_calls").is_none(),
+            "empty tool_calls must be omitted, got: {assistant}"
+        );
+    }
+
+    #[test]
+    fn assistant_tool_use_message_keeps_tool_calls() {
+        let payload = build_chat_completion_request(
+            &MessageRequest {
+                model: "qwen".to_string(),
+                max_tokens: 64,
+                messages: vec![InputMessage {
+                    role: "assistant".to_string(),
+                    content: vec![InputContentBlock::ToolUse {
+                        id: "call_1".to_string(),
+                        name: "read_file".to_string(),
+                        input: json!({"path": "a.rs"}),
+                    }],
+                }],
+                system: None,
+                tools: None,
+                tool_choice: None,
+                stream: false,
+            },
+            OpenAiCompatConfig::openai(),
+        );
+        let assistant = &payload["messages"][0];
+        assert_eq!(assistant["tool_calls"][0]["function"]["name"], json!("read_file"));
+    }
+
+    #[test]
     fn openai_streaming_requests_include_usage_opt_in() {
         let payload = build_chat_completion_request(
             &MessageRequest {
@@ -1018,6 +1095,29 @@ mod tests {
         );
 
         assert_eq!(payload["stream_options"], json!({"include_usage": true}));
+    }
+
+    #[test]
+    fn reasoning_delta_becomes_thinking_event() {
+        use super::{ChatCompletionChunk, StreamState};
+        use crate::types::{ContentBlockDelta, StreamEvent};
+
+        // OpenRouter / Qwen3 кладут размышления в delta.reasoning.
+        let chunk: ChatCompletionChunk = serde_json::from_str(
+            r#"{"id":"g1","model":"qwen","choices":[{"index":0,"delta":{"reasoning":"Hmm, let me think"},"finish_reason":null}]}"#,
+        )
+        .expect("chunk parses");
+        let mut state = StreamState::new("qwen".to_string());
+        let events = state.ingest_chunk(chunk).expect("ingest");
+
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                StreamEvent::ContentBlockDelta(delta)
+                    if matches!(&delta.delta, ContentBlockDelta::ThinkingDelta { thinking } if thinking == "Hmm, let me think")
+            )),
+            "expected a ThinkingDelta from reasoning, got: {events:?}"
+        );
     }
 
     #[test]

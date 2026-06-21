@@ -4,3 +4,7 @@ archive/
 # Local agent artifacts
 .claude/settings.local.json
 .claude/sessions/
+
+# Local session transcripts and OS junk
+.claw/
+.DS_Store

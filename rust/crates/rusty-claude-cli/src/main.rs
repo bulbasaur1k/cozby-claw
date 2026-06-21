@@ -26,7 +26,8 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 use api::{
     resolve_startup_auth_source, AnthropicClient, AuthSource, ContentBlockDelta, InputContentBlock,
     InputMessage, MessageRequest, MessageResponse, OpenAiCompatClient, OpenAiCompatConfig,
-    OutputContentBlock, PromptCache, StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition,
+    OutputContentBlock, PromptCache, ProviderClient, ProviderSlot, ProviderSlotKind,
+    ProvidersConfig, StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition,
     ToolResultContentBlock,
 };
 
@@ -2344,6 +2345,9 @@ impl LiveCli {
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        // Когда модель не задана явно, основным становится `[primary]` из
+        // providers.toml (если есть) — так и заголовок REPL, и запрос совпадают.
+        let model = effective_model(model);
         let system_prompt = build_system_prompt()?;
         let session_state = Session::new();
         let session = create_managed_session_handle(&session_state.session_id)?;
@@ -4967,7 +4971,7 @@ fn build_runtime_with_plugin_state(
     // External-model consultation is opt-in: present only when enabled in config
     // and the API key env var is set. When absent the tool is neither offered to
     // the model nor executable, and the internal model stays the only model.
-    let external_consult = ExternalConsultRuntime::from_config(feature_config.external_consult());
+    let external_consult = ExternalConsultRuntime::resolve(feature_config.external_consult());
     let mut runtime = ConversationRuntime::new_with_features(
         session,
         AnthropicRuntimeClient::new(
@@ -5079,10 +5083,14 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
     }
 }
 
+/// Рантайм-клиент основной модели. Под капотом — `ProviderClient`, поэтому
+/// одинаково работает и для нативного Anthropic, и для OpenAI-совместимого
+/// провайдера (qwen/OpenRouter), выбранного в `~/.claw/providers.toml`.
 struct AnthropicRuntimeClient {
     runtime: tokio::runtime::Runtime,
-    client: AnthropicClient,
+    client: ProviderClient,
     model: String,
+    max_tokens: u32,
     enable_tools: bool,
     emit_output: bool,
     allowed_tools: Option<AllowedToolSet>,
@@ -5103,12 +5111,12 @@ impl AnthropicRuntimeClient {
         progress_reporter: Option<InternalPromptProgressReporter>,
         external_consult_enabled: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        let (client, model, max_tokens) = build_primary_provider_client(session_id, model)?;
         Ok(Self {
             runtime: tokio::runtime::Runtime::new()?,
-            client: AnthropicClient::from_auth(resolve_cli_auth_source()?)
-                .with_base_url(api::read_base_url())
-                .with_prompt_cache(PromptCache::new(session_id)),
+            client,
             model,
+            max_tokens,
             enable_tools,
             emit_output,
             allowed_tools,
@@ -5117,6 +5125,62 @@ impl AnthropicRuntimeClient {
             external_consult_enabled,
         })
     }
+}
+
+/// Подменяет дефолтную модель на основную из `providers.toml`, если та задана и
+/// пользователь не указал `--model` явно (т.е. модель осталась дефолтной).
+fn effective_model(model: String) -> String {
+    if model == DEFAULT_MODEL {
+        if let Some(slot) = ProvidersConfig::load().primary {
+            if !slot.model.trim().is_empty() {
+                return slot.model;
+            }
+        }
+    }
+    model
+}
+
+/// Строит клиента основной модели. Если `[primary]` в providers.toml совпадает
+/// с запрошенной моделью — используем его (OpenAI-compat либо Anthropic с ключом
+/// из файла). Иначе — нативный Anthropic с OAuth/ключом из окружения, как раньше.
+fn build_primary_provider_client(
+    session_id: &str,
+    model: String,
+) -> Result<(ProviderClient, String, u32), Box<dyn std::error::Error>> {
+    if let Some(slot) = ProvidersConfig::load().primary {
+        if slot.model == model {
+            match slot.kind {
+                ProviderSlotKind::Openai => {
+                    return Ok((
+                        ProviderClient::OpenAi(slot.openai_client()),
+                        slot.model,
+                        slot.max_tokens,
+                    ));
+                }
+                ProviderSlotKind::Anthropic => {
+                    let auth = if slot.api_key.trim().is_empty() {
+                        resolve_cli_auth_source()?
+                    } else {
+                        AuthSource::ApiKey(slot.api_key.clone())
+                    };
+                    let base_url = if slot.base_url.trim().is_empty() {
+                        api::read_base_url()
+                    } else {
+                        slot.base_url.clone()
+                    };
+                    let client = AnthropicClient::from_auth(auth)
+                        .with_base_url(base_url)
+                        .with_prompt_cache(PromptCache::new(session_id));
+                    return Ok((ProviderClient::Anthropic(client), slot.model, slot.max_tokens));
+                }
+            }
+        }
+    }
+    let client = AnthropicClient::from_auth(resolve_cli_auth_source()?)
+        .with_base_url(api::read_base_url())
+        .with_prompt_cache(PromptCache::new(session_id));
+    let max_tokens = max_tokens_for_model(&model);
+    Ok((ProviderClient::Anthropic(client), model, max_tokens))
 }
 
 fn resolve_cli_auth_source() -> Result<AuthSource, Box<dyn std::error::Error>> {
@@ -5137,7 +5201,7 @@ impl ApiClient for AnthropicRuntimeClient {
         }
         let message_request = MessageRequest {
             model: self.model.clone(),
-            max_tokens: max_tokens_for_model(&self.model),
+            max_tokens: self.max_tokens.min(max_tokens_for_model(&self.model)),
             messages: convert_messages(&request.messages),
             system: (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n")),
             tools: self.enable_tools.then(|| {
@@ -5917,7 +5981,7 @@ fn response_to_events(
     Ok(events)
 }
 
-fn push_prompt_cache_record(client: &AnthropicClient, events: &mut Vec<AssistantEvent>) {
+fn push_prompt_cache_record(client: &ProviderClient, events: &mut Vec<AssistantEvent>) {
     if let Some(record) = client.take_last_prompt_cache_record() {
         if let Some(event) = prompt_cache_record_to_runtime_event(record) {
             events.push(AssistantEvent::PromptCache(event));
@@ -5963,6 +6027,36 @@ impl ExternalConsultRuntime {
             config: config.clone(),
             api_key,
         })
+    }
+
+    /// Строит вспомогательную модель из слота `[auxiliary]` providers.toml.
+    /// Ключ берётся прямо из файла (а не из env), endpoint — OpenAI-совместимый.
+    fn from_provider_slot(slot: &ProviderSlot) -> Option<Self> {
+        if slot.api_key.trim().is_empty() || slot.model.trim().is_empty() {
+            return None;
+        }
+        Some(Self {
+            config: ExternalConsultConfig {
+                enabled: true,
+                model: slot.model.clone(),
+                base_url: slot.base_url.clone(),
+                // Ключ задан напрямую в слоте — env-имя не используется.
+                api_key_env: String::new(),
+                audit_log: None,
+            },
+            api_key: slot.api_key.clone(),
+        })
+    }
+
+    /// Предпочитает `[auxiliary]` из providers.toml; иначе — `externalConsult`
+    /// из merged-конфига (ключ из env). `None`, если ничего не настроено.
+    fn resolve(config: Option<&ExternalConsultConfig>) -> Option<Self> {
+        if let Some(slot) = ProvidersConfig::load().auxiliary {
+            if let Some(runtime) = Self::from_provider_slot(&slot) {
+                return Some(runtime);
+            }
+        }
+        Self::from_config(config)
     }
 
     fn audit_path(&self) -> PathBuf {

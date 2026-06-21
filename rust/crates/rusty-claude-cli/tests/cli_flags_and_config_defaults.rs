@@ -16,7 +16,7 @@ fn status_command_applies_model_and_permission_mode_flags() {
     fs::create_dir_all(&temp_dir).expect("temp dir should exist");
 
     // when
-    let output = Command::new(env!("CARGO_BIN_EXE_claw"))
+    let output = Command::new(env!("CARGO_BIN_EXE_cozby-claw-cli"))
         .current_dir(&temp_dir)
         .args([
             "--model",
@@ -46,7 +46,7 @@ fn resume_flag_loads_a_saved_session_and_dispatches_status() {
     let session_path = write_session(&temp_dir, "resume-status");
 
     // when
-    let output = Command::new(env!("CARGO_BIN_EXE_claw"))
+    let output = Command::new(env!("CARGO_BIN_EXE_cozby-claw-cli"))
         .current_dir(&temp_dir)
         .args([
             "--resume",
@@ -74,12 +74,12 @@ fn slash_command_names_match_known_commands_and_suggest_nearby_unknown_ones() {
     fs::create_dir_all(&temp_dir).expect("temp dir should exist");
 
     // when
-    let help_output = Command::new(env!("CARGO_BIN_EXE_claw"))
+    let help_output = Command::new(env!("CARGO_BIN_EXE_cozby-claw-cli"))
         .current_dir(&temp_dir)
         .arg("/help")
         .output()
         .expect("claw should launch");
-    let unknown_output = Command::new(env!("CARGO_BIN_EXE_claw"))
+    let unknown_output = Command::new(env!("CARGO_BIN_EXE_cozby-claw-cli"))
         .current_dir(&temp_dir)
         .arg("/zstats")
         .output()
@@ -208,7 +208,7 @@ fn config_show_command_prints_merged_runtime_config_as_json() {
 }
 
 fn command_in(cwd: &Path) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_claw"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_cozby-claw-cli"));
     command.current_dir(cwd);
     command
 }

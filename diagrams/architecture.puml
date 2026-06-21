@@ -1,0 +1,61 @@
+@startuml
+skinparam componentStyle rectangle
+skinparam backgroundColor #F9F9F9
+skinparam shadowing false
+
+package "crates" {
+    [cli] as cli
+    [gui] as gui
+    [tools] as tools
+    [runtime] as runtime
+    [api] as api
+}
+
+package "Layers" {
+    [UI Layer] as ui_layer
+    [Agent Core] as agent_core
+    [Tools Library] as tools_lib
+    [API Client] as api_client
+}
+
+package "External" {
+    [User] as user
+    [LLM Provider] as llm_provider
+}
+
+' Привязка крейтов к слоям
+cli --> ui_layer : provides?
+gui --> ui_layer
+runtime --> agent_core
+tools --> tools_lib
+api --> api_client
+
+' Взаимодействие между слоями
+user <--> gui : interacts with
+gui --> runtime : sends prompts\nreceives events
+runtime --> tools : executes tools
+runtime --> api : sends requests\nreceives responses
+api --> llm_provider : HTTP API
+
+gui .[#3C89F7].> tools : uses for actions
+runtime .[#3C89F7].> tools : executes built-in\nfunctions
+
+note right of gui
+  Uses eframe + egui
+  Manages Agent thread
+  Renders UI
+end note
+
+note right of runtime
+  Manages session state\n  Tool routing\n  Permission enforcement\n  LLM orchestration
+end note
+
+note right of tools
+  Contains ~40 built-in\n  tools (bash, read_file,\n  WebSearch, Agent, etc.)
+end note
+
+note right of api
+  Abstracts LLM provider\n  (OpenAI-compatible,\n  Ollama, etc.)
+end note
+
+@enduml
