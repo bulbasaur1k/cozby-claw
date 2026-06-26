@@ -4,8 +4,7 @@ skinparam backgroundColor #F9F9F9
 skinparam shadowing false
 
 package "crates" {
-    [cli] as cli
-    [gui] as gui
+    [rusty-claude-cli] as cli
     [tools] as tools
     [runtime] as runtime
     [api] as api
@@ -24,26 +23,25 @@ package "External" {
 }
 
 ' Привязка крейтов к слоям
-cli --> ui_layer : provides?
-gui --> ui_layer
+cli --> ui_layer
 runtime --> agent_core
 tools --> tools_lib
 api --> api_client
 
 ' Взаимодействие между слоями
-user <--> gui : interacts with
-gui --> runtime : sends prompts\nreceives events
+user <--> cli : interacts with (terminal)
+cli --> runtime : sends prompts\nreceives events
 runtime --> tools : executes tools
 runtime --> api : sends requests\nreceives responses
 api --> llm_provider : HTTP API
 
-gui .[#3C89F7].> tools : uses for actions
+cli .[#3C89F7].> tools : uses for actions
 runtime .[#3C89F7].> tools : executes built-in\nfunctions
 
-note right of gui
-  Uses eframe + egui
-  Manages Agent thread
-  Renders UI
+note right of cli
+  Terminal REPL + one-shot
+  Builds runtime from TOML
+  Renders transcript
 end note
 
 note right of runtime
@@ -55,7 +53,7 @@ note right of tools
 end note
 
 note right of api
-  Abstracts LLM provider\n  (OpenAI-compatible,\n  Ollama, etc.)
+  Abstracts LLM provider\n  type = anthropic |\n  openai (OpenRouter,\n  qwen, DeepSeek, Ollama)
 end note
 
 @enduml

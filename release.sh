@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
-# release.sh — собирает release-бинари cozby-claw и «релизит» их в общий
-# каталог на PATH (по умолчанию ~/.local/bin), чтобы их можно было звать
-# из любого места как `cozby-claw-cli` / `cozby-claw-gui`.
+# release.sh — собирает release-бинарь cozby-claw и «релизит» его в общий
+# каталог на PATH (по умолчанию ~/.local/bin), чтобы его можно было звать
+# из любого места как `cozby-claw-cli`.
 #
 # Каталог установки переопределяется переменной COZBY_BIN_DIR:
 #     COZBY_BIN_DIR=/usr/local/bin ./release.sh
@@ -12,10 +12,10 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUST_DIR="$REPO_DIR/rust"
 INSTALL_DIR="${COZBY_BIN_DIR:-$HOME/.local/bin}"
-BINS=(cozby-claw-cli cozby-claw-gui)
+BINS=(cozby-claw-cli)
 
-echo "==> cargo build --release (cozby-claw-cli, cozby-claw-gui)"
-( cd "$RUST_DIR" && cargo build --release -p rusty-claude-cli -p gui )
+echo "==> cargo build --release (cozby-claw-cli)"
+( cd "$RUST_DIR" && cargo build --release -p rusty-claude-cli )
 
 echo "==> installing into $INSTALL_DIR"
 mkdir -p "$INSTALL_DIR"

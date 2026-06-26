@@ -9,7 +9,8 @@ publish.workspace = true
 api = { path = "../api" }
 plugins = { path = "../plugins" }
 runtime = { path = "../runtime" }
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+# native-tls → системное TLS-хранилище ОС (корп. внутренние CA доверяются).
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "native-tls"] }
 regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true

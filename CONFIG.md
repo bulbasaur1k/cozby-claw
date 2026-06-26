@@ -57,6 +57,42 @@ args = ["--flag"]
 
 Посмотреть, что подхватилось: `claw mcp list`.
 
+## providers.toml — выбор провайдера и модели
+
+`~/.claw/providers.toml` (вне git, права 600) задаёт, **каким провайдером и моделью**
+думает агент. Отдельный от `settings.*` файл — там фичи, тут модель/ключи.
+
+Слоты: `primary` (основная модель агента) и `auxiliary` (опц. — «более сильная»
+модель для инструмента `consult_external_model`). У каждого слота ключ `type`
+выбирает **протокол** провайдера (как `protocol` в qwen-code):
+
+| `type` | Протокол | Endpoint |
+|---|---|---|
+| `anthropic` | нативный Anthropic | `/v1/messages` |
+| `openai` | любой OpenAI-совместимый | `/v1/chat/completions` |
+
+`openai` покрывает любой совместимый сервис (OpenRouter, qwen/DashScope, DeepSeek,
+локальный Ollama/LM Studio/llama.cpp) — «кастомный» провайдер = `type = "openai"` +
+свой `base_url`.
+
+```toml
+[primary]
+type   = "openai"          # "openai" | "anthropic"  (алиас старого ключа: kind)
+model  = "qwen/qwen3-coder"
+base_url = "https://openrouter.ai/api/v1"
+api_key  = "sk-or-…"        # пусто для anthropic → берётся OAuth/ANTHROPIC_API_KEY
+max_tokens = 8192
+
+[auxiliary]
+type   = "openai"
+model  = "deepseek-chat"
+base_url = "https://api.deepseek.com/v1"
+api_key  = "sk-…"
+```
+
+Env-альтернатива: `OPENAI_API_KEY`/`OPENAI_BASE_URL`,
+`ANTHROPIC_API_KEY`/`ANTHROPIC_BASE_URL`. Подробности и примеры — в **[GUIDE.md](GUIDE.md)** §2.
+
 ## externalConsult — консультация у внешней модели (опционально)
 
 Основная модель остаётся внутренней; внешняя зовётся агентом по инструменту

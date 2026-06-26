@@ -1,12 +1,13 @@
-//! Общий конфиг провайдеров: `~/.claw/providers.toml` (вне git, права 600).
+//! Конфиг провайдеров: `~/.claw/providers.toml` (вне git, права 600).
 //!
-//! Один файл читают и CLI, и GUI. Хранит до трёх «слотов»:
+//! Хранит до трёх «слотов»:
 //! * `primary` — основная модель, которой думает агент;
 //! * `auxiliary` — вспомогательная (более сильная) модель для `consult`-инструмента;
 //! * `embedder` — зарезервировано под будущий RAG (сейчас парсится, но не используется).
 //!
-//! Ключи лежат прямо в файле для локального удобства (как в прежнем `gui.toml`),
-//! поэтому файл создаётся с правами `0600` и не должен попадать в репозиторий.
+//! Протокол каждого слота задаётся ключом `type` (`anthropic` | `openai`). Ключи
+//! лежат прямо в файле для локального удобства, поэтому файл создаётся с правами
+//! `0600` и не должен попадать в репозиторий.
 
 use std::path::PathBuf;
 
@@ -14,13 +15,19 @@ use serde::{Deserialize, Serialize};
 
 use crate::providers::openai_compat::{OpenAiCompatClient, OpenAiCompatConfig};
 
-/// Тип провайдера в слоте.
+/// Протокол провайдера в слоте — какой «диалект» API использовать.
+///
+/// В TOML задаётся ключом `type` (как `protocol` в qwen-code); для обратной
+/// совместимости принимается и старый ключ `kind`. Значение `openai` покрывает
+/// любой OpenAI-совместимый endpoint (`OpenRouter`, qwen/`DashScope`, `DeepSeek`,
+/// локальный `llama.cpp`/`Ollama`, …) — «кастомный» провайдер задаётся как
+/// `type = "openai"` + произвольный `base_url`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ProviderSlotKind {
     /// Нативный Anthropic API (`/v1/messages`).
     Anthropic,
-    /// Любой OpenAI-совместимый endpoint (`/v1/chat/completions`), напр. OpenRouter.
+    /// Любой OpenAI-совместимый endpoint (`/v1/chat/completions`), напр. `OpenRouter`.
     #[default]
     Openai,
 }
@@ -42,7 +49,9 @@ fn default_max_tokens() -> u32 {
 /// Один настроенный провайдер: модель + endpoint + ключ.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderSlot {
-    #[serde(default)]
+    /// Протокол провайдера. Канонический TOML-ключ — `type`; алиас `kind`
+    /// принимается для файлов, созданных старыми версиями.
+    #[serde(default, rename = "type", alias = "kind")]
     pub kind: ProviderSlotKind,
     pub model: String,
     #[serde(default)]
@@ -159,6 +168,49 @@ mod tests {
         let auxiliary = config.auxiliary.expect("auxiliary present");
         assert_eq!(auxiliary.max_tokens, 4096);
         assert!(config.embedder.is_none(), "embedder slot stays reserved");
+    }
+
+    #[test]
+    fn type_key_selects_protocol_and_kind_is_accepted_as_alias() {
+        // Канонический ключ — `type` (как `protocol` в qwen-code).
+        let with_type = r#"
+            [primary]
+            type = "anthropic"
+            model = "claude-opus-4-8"
+
+            [auxiliary]
+            type = "openai"
+            model = "deepseek-chat"
+            base_url = "https://api.deepseek.com/v1"
+            api_key = "sk-deepseek"
+        "#;
+        let config: ProvidersConfig = toml::from_str(with_type).expect("parses `type`");
+        assert_eq!(config.primary.expect("primary").kind, ProviderSlotKind::Anthropic);
+        assert_eq!(
+            config.auxiliary.expect("auxiliary").kind,
+            ProviderSlotKind::Openai
+        );
+
+        // Старый ключ `kind` всё ещё принимается как алиас.
+        let with_kind: ProvidersConfig = toml::from_str(
+            "[primary]\nkind = \"anthropic\"\nmodel = \"claude-opus-4-8\"\n",
+        )
+        .expect("parses legacy `kind`");
+        assert_eq!(
+            with_kind.primary.expect("primary").kind,
+            ProviderSlotKind::Anthropic
+        );
+    }
+
+    #[test]
+    fn serialized_slot_uses_type_key() {
+        let config: ProvidersConfig =
+            toml::from_str("[primary]\ntype=\"anthropic\"\nmodel=\"m\"\n").expect("parses");
+        let serialized = toml::to_string_pretty(&config).expect("serializes");
+        assert!(
+            serialized.contains("type = \"anthropic\""),
+            "save format must emit `type`, got: {serialized}"
+        );
     }
 
     #[test]
