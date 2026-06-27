@@ -141,6 +141,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    // Закрыть активную вкладку (⌘/Ctrl+W).
+    {
+        let ui_weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_close_current(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            {
+                let mut st = state.borrow_mut();
+                let active = st.active;
+                if st.sessions.len() > 1 {
+                    st.sessions.remove(active);
+                    if st.active >= st.sessions.len() {
+                        st.active = st.sessions.len() - 1;
+                    }
+                }
+            }
+            apply_active(&ui, &state.borrow());
+        });
+    }
+
     // Ответы модалок — той сессии, что их запросила.
     {
         let state = state.clone();

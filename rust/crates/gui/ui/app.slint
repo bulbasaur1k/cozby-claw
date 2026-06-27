@@ -111,6 +111,7 @@ export component AppWindow inherits Window {
     callback select-tab(int);
     callback new-tab();
     callback close-tab(int);
+    callback close-current();
 
     // Модалка запроса разрешения на инструмент.
     in property <bool> perm-open: false;
@@ -346,6 +347,7 @@ export component AppWindow inherits Window {
                             wrap: word-wrap;
                             single-line: false;
                             // Enter — отправить, Shift+Enter — перенос, Esc — прервать ход.
+                            // ⌘/Ctrl+T — новая вкладка, +W — закрыть, +1..9 — переключение.
                             key-pressed(event) => {
                                 if (event.text == Key.Return && !event.modifiers.shift) {
                                     root.send();
@@ -354,6 +356,19 @@ export component AppWindow inherits Window {
                                 if (event.text == Key.Escape && root.busy) {
                                     root.interrupt();
                                     return EventResult.accept;
+                                }
+                                if (event.modifiers.control || event.modifiers.meta) {
+                                    if (event.text == "t") { root.new-tab(); return EventResult.accept; }
+                                    if (event.text == "w") { root.close-current(); return EventResult.accept; }
+                                    if (event.text == "1") { root.select-tab(0); return EventResult.accept; }
+                                    if (event.text == "2") { root.select-tab(1); return EventResult.accept; }
+                                    if (event.text == "3") { root.select-tab(2); return EventResult.accept; }
+                                    if (event.text == "4") { root.select-tab(3); return EventResult.accept; }
+                                    if (event.text == "5") { root.select-tab(4); return EventResult.accept; }
+                                    if (event.text == "6") { root.select-tab(5); return EventResult.accept; }
+                                    if (event.text == "7") { root.select-tab(6); return EventResult.accept; }
+                                    if (event.text == "8") { root.select-tab(7); return EventResult.accept; }
+                                    if (event.text == "9") { root.select-tab(8); return EventResult.accept; }
                                 }
                                 return EventResult.reject;
                             }
