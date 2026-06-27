@@ -15,6 +15,7 @@ slint = "1"
 runtime = { path = "../runtime" }
 api = { path = "../api" }
 tools = { path = "../tools" }
+rfd = "0.15"
 serde_json.workspace = true
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
 

@@ -84,6 +84,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    // Прикрепление файлов: нативный диалог → пути добавляются в поле ввода,
+    // чтобы агент прочитал их инструментами (read_file и т.п.).
+    {
+        let ui_weak = ui.as_weak();
+        ui.on_attach(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            if let Some(paths) = rfd::FileDialog::new().pick_files() {
+                let joined = paths
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let current = ui.get_input_text().to_string();
+                let combined = if current.trim().is_empty() {
+                    joined
+                } else {
+                    format!("{current} {joined}")
+                };
+                ui.set_input_text(combined.into());
+            }
+        });
+    }
+
     // Новая вкладка-сессия.
     {
         let ui_weak = ui.as_weak();
@@ -158,6 +181,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             apply_active(&ui, &state.borrow());
+        });
+    }
+
+    // Переименование вкладки: двойной клик → редактор, Enter/Esc → сохранить.
+    {
+        let ui_weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_start_rename(move |idx| {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let st = state.borrow();
+            if let Some(tab) = usize::try_from(idx).ok().and_then(|i| st.sessions.get(i)) {
+                ui.set_edit_title(tab.title.as_str().into());
+                ui.set_editing_tab(idx);
+            }
+        });
+    }
+    {
+        let ui_weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_commit_rename(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let editing = ui.get_editing_tab();
+            if let Ok(i) = usize::try_from(editing) {
+                let title = ui.get_edit_title().to_string().trim().to_string();
+                let mut st = state.borrow_mut();
+                if !title.is_empty() {
+                    if let Some(tab) = st.sessions.get_mut(i) {
+                        tab.title = title;
+                    }
+                }
+                set_tabs(&ui, &st);
+            }
+            ui.set_editing_tab(-1);
         });
     }
 
