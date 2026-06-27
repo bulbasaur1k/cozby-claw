@@ -4,7 +4,7 @@
 //! реестр инструментов `tools`); `ApiClient` / `ToolExecutor` / `PermissionPrompter`
 //! шлют события в UI-канал. Ход гоняется в отдельном потоке; отмена — атомарный флаг.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
@@ -109,8 +109,14 @@ fn system_prompt(cwd: &Path) -> Vec<String> {
 }
 
 /// Запускает agent-воркер в отдельном потоке и возвращает ручку с каналами.
+/// `save_path` (если задан) — куда сохранять сессию после каждого хода.
 #[must_use]
-pub fn spawn_agent(model: String, mode: PermissionMode, session: Session) -> AgentHandle {
+pub fn spawn_agent(
+    model: String,
+    mode: PermissionMode,
+    session: Session,
+    save_path: Option<PathBuf>,
+) -> AgentHandle {
     let (to_agent_tx, to_agent_rx) = mpsc::channel::<UiToAgent>();
     let (from_agent_tx, from_agent_rx) = mpsc::channel::<AgentToUi>();
     let (perm_tx, perm_rx) = mpsc::channel::<bool>();
@@ -123,6 +129,7 @@ pub fn spawn_agent(model: String, mode: PermissionMode, session: Session) -> Age
             model,
             mode,
             session,
+            save_path,
             &to_agent_rx,
             &from_agent_tx,
             perm_rx,
@@ -145,6 +152,7 @@ fn worker(
     model: String,
     mode: PermissionMode,
     session: Session,
+    save_path: Option<PathBuf>,
     rx: &Receiver<UiToAgent>,
     tx: &Sender<AgentToUi>,
     perm_rx: Receiver<bool>,
@@ -197,6 +205,10 @@ fn worker(
                     Err(error) => {
                         let _ = tx.send(AgentToUi::Error(error.to_string()));
                     }
+                }
+                // Сохраняем сессию ВСЕГДА (и при ошибке хода), чтобы история не терялась.
+                if let Some(path) = &save_path {
+                    let _ = runtime.session().save_to_path(path);
                 }
                 let _ = tx.send(AgentToUi::Activity(Activity::Idle));
             }

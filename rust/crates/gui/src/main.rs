@@ -8,11 +8,12 @@ mod protocol;
 mod worker;
 
 use std::cell::RefCell;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use runtime::{PermissionMode, Session};
+use runtime::{ContentBlock, MessageRole, PermissionMode, Session};
 use slint::{ComponentHandle, Model, ModelRc, SharedString, Timer, TimerMode, VecModel, Weak};
 
 use protocol::{Activity, AgentHandle, AgentToUi, UiToAgent};
@@ -46,14 +47,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return;
             }
             ui.set_input_text(SharedString::new());
-            let st = state.borrow();
-            let tab = &st.sessions[st.active];
-            tab.messages.push(Message {
-                role: "user".into(),
-                code: false,
-                text: text.clone().into(),
-            });
-            let _ = tab.handle.to_agent.send(UiToAgent::Prompt(text));
+            let mut st = state.borrow_mut();
+            let active = st.active;
+            // Первое сообщение задаёт осмысленный заголовок вкладки.
+            let first = st.sessions[active].messages.row_count() == 0;
+            if first {
+                st.sessions[active].title = first_line(&text, 24);
+            }
+            {
+                let tab = &st.sessions[active];
+                tab.messages.push(Message {
+                    role: "user".into(),
+                    code: false,
+                    text: text.clone().into(),
+                });
+                let _ = tab.handle.to_agent.send(UiToAgent::Prompt(text));
+            }
+            if first {
+                set_tabs(&ui, &st);
+            }
             ui.set_busy(true);
             ui.set_status("думает…".into());
             ui.invoke_scroll_to_bottom();
@@ -224,10 +236,26 @@ struct SessionTab {
 
 impl SessionTab {
     fn new(model: String, mode: PermissionMode, id: usize) -> Self {
+        Self::from_session(model, mode, Session::new(), Some(format!("Сессия {id}")))
+    }
+
+    /// Строит вкладку из (новой или загруженной) сессии: путь сохранения по
+    /// её id, заголовок из первого сообщения, восстановленная лента.
+    fn from_session(
+        model: String,
+        mode: PermissionMode,
+        session: Session,
+        default_title: Option<String>,
+    ) -> Self {
+        let save_path = sessions_dir().map(|dir| dir.join(format!("{}.jsonl", session.session_id)));
+        let title = title_from_session(&session)
+            .or(default_title)
+            .unwrap_or_else(|| "Сессия".to_string());
+        let messages = Rc::new(VecModel::from(rebuild_messages(&session)));
         Self {
-            handle: worker::spawn_agent(model, mode, Session::new()),
-            messages: Rc::new(VecModel::default()),
-            title: format!("Сессия {id}"),
+            handle: worker::spawn_agent(model, mode, session, save_path),
+            messages,
+            title,
             stream: None,
             in_tok: 0,
             out_tok: 0,
@@ -252,13 +280,17 @@ struct AppState {
 
 impl AppState {
     fn new(model: String, mode: PermissionMode) -> Self {
-        let first = SessionTab::new(model.clone(), mode, 1);
+        let mut sessions = load_recent_sessions(&model, mode);
+        if sessions.is_empty() {
+            sessions.push(SessionTab::new(model.clone(), mode, 1));
+        }
+        let next_id = sessions.len() + 1;
         Self {
-            sessions: vec![first],
+            sessions,
             active: 0,
             model,
             mode,
-            next_id: 2,
+            next_id,
             modal_session: None,
         }
     }
@@ -268,6 +300,100 @@ impl AppState {
         self.next_id += 1;
         id
     }
+}
+
+/// Каталог сессий проекта (`<cwd>/.claw/sessions`), создаёт при отсутствии.
+fn sessions_dir() -> Option<PathBuf> {
+    let dir = std::env::current_dir().ok()?.join(".claw").join("sessions");
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir)
+}
+
+/// Загружает до 6 последних непустых сессий (новые — первыми) как вкладки.
+fn load_recent_sessions(model: &str, mode: PermissionMode) -> Vec<SessionTab> {
+    let Some(dir) = sessions_dir() else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut files: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+        .filter_map(|path| {
+            let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok()?;
+            Some((mtime, path))
+        })
+        .collect();
+    files.sort_by(|a, b| b.0.cmp(&a.0));
+    files
+        .into_iter()
+        .filter_map(|(_, path)| Session::load_from_path(&path).ok())
+        .filter(|session| !session.messages.is_empty())
+        .take(6)
+        .map(|session| SessionTab::from_session(model.to_string(), mode, session, None))
+        .collect()
+}
+
+/// Восстанавливает строки ленты из истории сессии.
+fn rebuild_messages(session: &Session) -> Vec<Message> {
+    let mut rows = Vec::new();
+    for message in &session.messages {
+        for block in &message.blocks {
+            match block {
+                ContentBlock::Text { text } => {
+                    if text.trim().is_empty() {
+                        continue;
+                    }
+                    match message.role {
+                        MessageRole::User => rows.push(mk_row("user", false, text)),
+                        MessageRole::Assistant => {
+                            for (code, part) in to_blocks(text) {
+                                rows.push(mk_row("assistant", code, &part));
+                            }
+                        }
+                        MessageRole::System | MessageRole::Tool => {}
+                    }
+                }
+                ContentBlock::ToolUse { name, input, .. } => {
+                    rows.push(mk_row(
+                        "tool",
+                        false,
+                        &format!("{name}   {}", first_line(input, 160)),
+                    ));
+                }
+                ContentBlock::ToolResult {
+                    output, is_error, ..
+                } => {
+                    let role = if *is_error { "error" } else { "system" };
+                    rows.push(mk_row(role, false, &format!("⎿ {}", first_line(output, 200))));
+                }
+            }
+        }
+    }
+    rows
+}
+
+fn mk_row(role: &str, code: bool, text: &str) -> Message {
+    Message {
+        role: role.into(),
+        code,
+        text: text.into(),
+    }
+}
+
+/// Заголовок вкладки из первого пользовательского сообщения сессии.
+fn title_from_session(session: &Session) -> Option<String> {
+    session.messages.iter().find_map(|message| {
+        if message.role != MessageRole::User {
+            return None;
+        }
+        message.blocks.iter().find_map(|block| match block {
+            ContentBlock::Text { text } if !text.trim().is_empty() => Some(first_line(text, 24)),
+            _ => None,
+        })
+    })
 }
 
 /// Привязывает к UI активную сессию (лента, статус, токены) и таб-бар.
