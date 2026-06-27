@@ -98,6 +98,21 @@ export component AppWindow inherits Window {
     in-out property <string> input-text;
     callback send();
 
+    // Модалка запроса разрешения на инструмент.
+    in property <bool> perm-open: false;
+    in property <string> perm-tool;
+    in property <string> perm-input;
+    in property <string> perm-reason;
+    callback perm-allow();
+    callback perm-deny();
+
+    // Модалка вопроса модели (AskUserQuestion).
+    in property <bool> q-open: false;
+    in property <string> q-text;
+    in property <[string]> q-options;
+    callback q-choose(string);
+    callback q-skip();
+
     Rectangle {
         x: root.width - 460px;
         y: -200px;
@@ -267,6 +282,161 @@ export component AppWindow inherits Window {
                         text: "Сообщение агенту…";
                         color: #4f586e;
                         font-size: 17px;
+                    }
+                }
+            }
+        }
+    }
+
+    // --- модалка разрешения ---
+    if root.perm-open: Rectangle {
+        width: 100%;
+        height: 100%;
+        background: rgba(8, 10, 16, 0.62);
+        TouchArea { }
+        VerticalLayout {
+            alignment: center;
+            HorizontalLayout {
+                alignment: center;
+                Rectangle {
+                    width: 480px;
+                    background: #161a23;
+                    border-radius: 14px;
+                    border-width: 1px;
+                    border-color: rgba(255, 255, 255, 0.10);
+                    VerticalLayout {
+                        padding: 22px;
+                        spacing: 12px;
+                        Text {
+                            text: "Разрешить инструмент?";
+                            color: #e2e7ef;
+                            font-size: 17px;
+                            font-weight: 600;
+                        }
+                        Text {
+                            text: root.perm-tool;
+                            color: #aeb6c6;
+                            font-size: 15px;
+                            font-family: "Menlo";
+                        }
+                        Text {
+                            text: root.perm-input;
+                            color: #8e99af;
+                            font-size: 13px;
+                            font-family: "Menlo";
+                            wrap: word-wrap;
+                        }
+                        if root.perm-reason != "": Text {
+                            text: root.perm-reason;
+                            color: #8e99af;
+                            font-size: 13px;
+                            wrap: word-wrap;
+                        }
+                        HorizontalLayout {
+                            spacing: 10px;
+                            padding-top: 4px;
+                            Rectangle {
+                                horizontal-stretch: 1;
+                                height: 38px;
+                                border-radius: 10px;
+                                background: deny-ta.has-hover ? #242a36 : #1c212b;
+                                border-width: 1px;
+                                border-color: rgba(255, 255, 255, 0.08);
+                                Text {
+                                    text: "Отклонить";
+                                    color: #c2c9d6;
+                                    font-size: 14px;
+                                }
+                                deny-ta := TouchArea {
+                                    clicked => {
+                                        root.perm-deny();
+                                    }
+                                }
+                            }
+                            Rectangle {
+                                horizontal-stretch: 1;
+                                height: 38px;
+                                border-radius: 10px;
+                                background: allow-ta.has-hover ? #38436a : #313a5c;
+                                Text {
+                                    text: "Разрешить";
+                                    color: #e7ebf6;
+                                    font-size: 14px;
+                                    font-weight: 600;
+                                }
+                                allow-ta := TouchArea {
+                                    clicked => {
+                                        root.perm-allow();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // --- модалка вопроса модели ---
+    if root.q-open: Rectangle {
+        width: 100%;
+        height: 100%;
+        background: rgba(8, 10, 16, 0.62);
+        TouchArea { }
+        VerticalLayout {
+            alignment: center;
+            HorizontalLayout {
+                alignment: center;
+                Rectangle {
+                    width: 520px;
+                    background: #161a23;
+                    border-radius: 14px;
+                    border-width: 1px;
+                    border-color: rgba(255, 255, 255, 0.10);
+                    VerticalLayout {
+                        padding: 22px;
+                        spacing: 10px;
+                        Text {
+                            text: root.q-text;
+                            color: #e2e7ef;
+                            font-size: 16px;
+                            wrap: word-wrap;
+                        }
+                        for opt in root.q-options: Rectangle {
+                            height: 38px;
+                            border-radius: 10px;
+                            background: opt-ta.has-hover ? #242c3c : #1c212b;
+                            border-width: 1px;
+                            border-color: rgba(255, 255, 255, 0.08);
+                            HorizontalLayout {
+                                padding-left: 14px;
+                                padding-right: 14px;
+                                Text {
+                                    vertical-alignment: center;
+                                    text: opt;
+                                    color: #d2d8e2;
+                                    font-size: 14px;
+                                }
+                            }
+                            opt-ta := TouchArea {
+                                clicked => {
+                                    root.q-choose(opt);
+                                }
+                            }
+                        }
+                        Rectangle {
+                            height: 34px;
+                            Text {
+                                text: "Пропустить";
+                                color: #6b7384;
+                                font-size: 13px;
+                            }
+                            skip-ta := TouchArea {
+                                clicked => {
+                                    root.q-skip();
+                                }
+                            }
+                        }
                     }
                 }
             }

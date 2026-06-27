@@ -65,6 +65,46 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    // Ответы модалок воркеру (он блокируется в recv до ответа пользователя).
+    {
+        let ui_weak = ui.as_weak();
+        let deny_tx = permission_reply.clone();
+        ui.on_perm_deny(move || {
+            let _ = deny_tx.send(false);
+            if let Some(ui) = ui_weak.upgrade() {
+                ui.set_perm_open(false);
+            }
+        });
+    }
+    {
+        let ui_weak = ui.as_weak();
+        ui.on_perm_allow(move || {
+            let _ = permission_reply.send(true);
+            if let Some(ui) = ui_weak.upgrade() {
+                ui.set_perm_open(false);
+            }
+        });
+    }
+    {
+        let ui_weak = ui.as_weak();
+        let skip_tx = question_reply.clone();
+        ui.on_q_skip(move || {
+            let _ = skip_tx.send(String::new());
+            if let Some(ui) = ui_weak.upgrade() {
+                ui.set_q_open(false);
+            }
+        });
+    }
+    {
+        let ui_weak = ui.as_weak();
+        ui.on_q_choose(move |opt| {
+            let _ = question_reply.send(opt.to_string());
+            if let Some(ui) = ui_weak.upgrade() {
+                ui.set_q_open(false);
+            }
+        });
+    }
+
     // Дренаж событий воркера в UI (на потоке событий Slint, ~30 мс).
     let timer = Timer::default();
     {
@@ -130,17 +170,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     other => {
                         // ToolCall / ToolResult / PermissionAsk / AskUser / Usage —
-                        // закрывают текущий ответ и пишут свою строку.
+                        // закрывают текущий ответ и пишут свою строку / открывают модалку.
                         finalize_blocks(&messages, &mut stream);
-                        apply_event(
-                            &ui,
-                            &messages,
-                            &permission_reply,
-                            &question_reply,
-                            &mut in_tok,
-                            &mut out_tok,
-                            other,
-                        );
+                        apply_event(&ui, &messages, &mut in_tok, &mut out_tok, other);
                     }
                 }
             }
@@ -164,13 +196,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Применяет одно событие воркера к UI-состоянию.
-#[allow(clippy::too_many_arguments)]
+/// Применяет одно событие воркера к UI-состоянию. Запросы прав/вопросы открывают
+/// модалку; ответ шлёт воркеру коллбэк модалки (см. `main`), а не эта функция.
 fn apply_event(
     ui: &AppWindow,
     messages: &VecModel<Message>,
-    permission_reply: &std::sync::mpsc::Sender<bool>,
-    question_reply: &std::sync::mpsc::Sender<String>,
     in_tok: &mut u64,
     out_tok: &mut u64,
     event: AgentToUi,
@@ -192,32 +222,16 @@ fn apply_event(
             input,
             reason,
         } => {
-            let why = reason.map_or_else(String::new, |r| format!(" — {r}"));
-            push(
-                messages,
-                "system",
-                &format!(
-                    "⚠ запрошено разрешение на «{tool_name}» ({}){why} — отклонено (модалка в следующей фазе)",
-                    first_line(&input, 80)
-                ),
-            );
-            let _ = permission_reply.send(false);
+            ui.set_perm_tool(tool_name.into());
+            ui.set_perm_input(first_line(&input, 240).into());
+            ui.set_perm_reason(reason.unwrap_or_default().into());
+            ui.set_perm_open(true);
         }
         AgentToUi::AskUser { question, options } => {
-            let opts = if options.is_empty() {
-                String::new()
-            } else {
-                format!("  [{}]", options.join(" / "))
-            };
-            push(
-                messages,
-                "system",
-                &format!(
-                    "❓ вопрос модели пропущен (модалка в следующей фазе): {}{opts}",
-                    first_line(&question, 160)
-                ),
-            );
-            let _ = question_reply.send(String::new());
+            ui.set_q_text(question.into());
+            let opts: Vec<SharedString> = options.iter().map(|o| o.as_str().into()).collect();
+            ui.set_q_options(ModelRc::from(Rc::new(VecModel::from(opts))));
+            ui.set_q_open(true);
         }
         AgentToUi::Usage {
             input_tokens,
