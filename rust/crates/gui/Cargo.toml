@@ -1,0 +1,35 @@
+[package]
+name = "gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "cozby-claw-gui — нативный Slint fluid-GUI поверх агентного рантайма."
+
+[[bin]]
+name = "cozby-claw-gui"
+path = "src/main.rs"
+
+[dependencies]
+slint = "1"
+runtime = { path = "../runtime" }
+api = { path = "../api" }
+tools = { path = "../tools" }
+serde_json.workspace = true
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
+
+[build-dependencies]
+slint-build = "1"
+
+# Не наследуем workspace-линты: Slint генерирует код с `#[allow(unsafe_code)]`,
+# что несовместимо с workspace `unsafe_code = "forbid"` (E0453). Дублируем
+# clippy-настройки воркспейса, но разрешаем unsafe (нужно генератору Slint).
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_panics_doc = "allow"
+missing_errors_doc = "allow"

@@ -12,10 +12,10 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUST_DIR="$REPO_DIR/rust"
 INSTALL_DIR="${COZBY_BIN_DIR:-$HOME/.local/bin}"
-BINS=(cozby-claw-cli)
+BINS=(cozby-claw-cli cozby-claw-gui)
 
-echo "==> cargo build --release (cozby-claw-cli)"
-( cd "$RUST_DIR" && cargo build --release -p rusty-claude-cli )
+echo "==> cargo build --release (cozby-claw-cli, cozby-claw-gui)"
+( cd "$RUST_DIR" && cargo build --release -p rusty-claude-cli -p gui )
 
 echo "==> installing into $INSTALL_DIR"
 mkdir -p "$INSTALL_DIR"

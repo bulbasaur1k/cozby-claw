@@ -1,0 +1,279 @@
+import { ScrollView } from "std-widgets.slint";
+
+// Одна запись транскрипта. `code` = блок кода (моно-панель). Каждое сообщение
+// ассистента раскладывается на несколько таких записей (текст / код).
+export struct Message {
+    role: string,
+    code: bool,
+    text: string,
+}
+
+component Entry {
+    in property <string> role;
+    in property <bool> code;
+    in property <string> text;
+    property <bool> is-user: root.role == "user";
+    property <bool> is-error: root.role == "error";
+    property <bool> is-thinking: root.role == "thinking";
+    // Моно-роли (служебные), не считая блоков кода — у них своя панель.
+    property <bool> is-mono: root.role == "tool" || root.role == "thinking" || root.role == "system";
+
+    HorizontalLayout {
+        // Реплика пользователя: только логическая группировка — полоса слева +
+        // текст (без фона/бордера). Обнимает текст (≤640px), прижата влево.
+        if root.is-user: HorizontalLayout {
+            spacing: 12px;
+            Rectangle {
+                width: 2px;
+                background: #6f76a8;
+            }
+            VerticalLayout {
+                max-width: 640px;
+                spacing: 5px;
+                Text {
+                    text: "Вы";
+                    color: #7c83b5;
+                    font-size: 13px;
+                    font-weight: 600;
+                }
+                Text {
+                    text: root.text;
+                    wrap: word-wrap;
+                    color: #e2e7ef;
+                    font-size: 17px;
+                }
+            }
+            Rectangle {
+                horizontal-stretch: 1;
+            }
+        }
+
+        // Блок кода ассистента: моноширинная панель.
+        if !root.is-user && root.code: Rectangle {
+            horizontal-stretch: 1;
+            background: #0f1219;
+            border-radius: 8px;
+            border-width: 1px;
+            border-color: rgba(255, 255, 255, 0.06);
+            HorizontalLayout {
+                padding: 12px;
+                Text {
+                    horizontal-stretch: 1;
+                    text: root.text;
+                    wrap: word-wrap;
+                    color: #b9c2d6;
+                    font-size: 14px;
+                    font-family: "Menlo";
+                }
+            }
+        }
+
+        // Обычный текст ассистента / служебные строки.
+        if !root.is-user && !root.code: Text {
+            horizontal-stretch: 1;
+            text: root.text;
+            wrap: word-wrap;
+            color: root.is-error ? #d39595 : root.is-mono ? #8e99af : #d2d8e2;
+            font-size: root.is-mono ? 14px : 17px;
+            font-italic: root.is-thinking;
+            font-family: root.is-mono ? "Menlo" : "";
+        }
+    }
+}
+
+export component AppWindow inherits Window {
+    title: "cozby-claw";
+    preferred-width: 940px;
+    preferred-height: 720px;
+    min-width: 560px;
+    min-height: 420px;
+    background: #0d0f14;
+
+    in property <[Message]> messages;
+    in property <string> model-name: "—";
+    in property <string> status: "готов";
+    in property <string> usage: "";
+    in property <string> branch: "";
+    in property <bool> busy: false;
+    in-out property <string> input-text;
+    callback send();
+
+    Rectangle {
+        x: root.width - 460px;
+        y: -200px;
+        width: 660px;
+        height: 660px;
+        border-radius: 330px;
+        background: @radial-gradient(circle, rgba(110, 118, 168, 0.05) 0%, transparent 70%);
+    }
+
+    VerticalLayout {
+        // --- шапка ---
+        Rectangle {
+            height: 48px;
+            HorizontalLayout {
+                padding-left: 24px;
+                padding-right: 24px;
+                spacing: 14px;
+                VerticalLayout {
+                    alignment: center;
+                    Text {
+                        text: "cozby-claw";
+                        color: #aeb6c6;
+                        font-size: 17px;
+                        font-weight: 600;
+                    }
+                }
+                Rectangle { horizontal-stretch: 1; }
+                VerticalLayout {
+                    alignment: center;
+                    Text {
+                        text: root.usage;
+                        color: #4f586e;
+                        font-size: 14px;
+                    }
+                }
+                VerticalLayout {
+                    alignment: center;
+                    Text {
+                        text: root.branch == "" ? "" : "⎇ " + root.branch;
+                        color: #6b7384;
+                        font-size: 15px;
+                    }
+                }
+                VerticalLayout {
+                    alignment: center;
+                    Text {
+                        text: root.model-name;
+                        color: #8a93a8;
+                        font-size: 15px;
+                    }
+                }
+                VerticalLayout {
+                    alignment: center;
+                    Rectangle {
+                        width: 9px;
+                        height: 9px;
+                        border-radius: 4.5px;
+                        background: root.busy ? #b59866 : #7f9a86;
+                        animate background { duration: 500ms; }
+                    }
+                }
+                VerticalLayout {
+                    alignment: center;
+                    Text {
+                        text: root.status;
+                        color: root.busy ? #b59866 : #8a93a8;
+                        font-size: 15px;
+                    }
+                }
+            }
+        }
+        Rectangle {
+            height: 1px;
+            background: rgba(255, 255, 255, 0.05);
+        }
+
+        // --- транскрипт ---
+        // alignment: start — записи паковать ОТ ВЕРХА с высотой по содержимому
+        // (иначе VerticalLayout растягивает единственную запись на всю высоту).
+        scroll := ScrollView {
+            VerticalLayout {
+                width: scroll.visible-width;
+                alignment: start;
+                padding-left: 28px;
+                padding-right: 28px;
+                padding-top: 20px;
+                padding-bottom: 20px;
+                spacing: 16px;
+                for msg in root.messages: Entry {
+                    role: msg.role;
+                    code: msg.code;
+                    text: msg.text;
+                }
+            }
+        }
+
+        Rectangle {
+            height: 1px;
+            background: rgba(255, 255, 255, 0.05);
+        }
+
+        // --- ввод: иконка-отправка прямо в поле, отдельной кнопки нет ---
+        Rectangle {
+            height: 84px;
+            HorizontalLayout {
+                padding-left: 20px;
+                padding-right: 20px;
+                padding-top: 14px;
+                padding-bottom: 14px;
+
+                Rectangle {
+                    horizontal-stretch: 1;
+                    border-radius: 12px;
+                    background: #161922;
+                    border-width: 1px;
+                    border-color: rgba(255, 255, 255, 0.08);
+                    HorizontalLayout {
+                        padding-left: 14px;
+                        padding-right: 8px;
+                        padding-top: 8px;
+                        padding-bottom: 8px;
+                        spacing: 8px;
+                        input := TextInput {
+                            horizontal-stretch: 1;
+                            text <=> root.input-text;
+                            color: #dce1ea;
+                            font-size: 17px;
+                            wrap: word-wrap;
+                            single-line: false;
+                            // Enter — отправить, Shift+Enter — перенос строки.
+                            key-pressed(event) => {
+                                if (event.text == Key.Return && !event.modifiers.shift) {
+                                    root.send();
+                                    return EventResult.accept;
+                                }
+                                return EventResult.reject;
+                            }
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            Rectangle {
+                                width: 36px;
+                                height: 36px;
+                                border-radius: 10px;
+                                background: ta.has-hover ? #2a3144 : #222838;
+                                Path {
+                                    width: 36px;
+                                    height: 36px;
+                                    viewbox-width: 36;
+                                    viewbox-height: 36;
+                                    commands: "M 18 11 L 18 25 M 18 11 L 12 17 M 18 11 L 24 17";
+                                    stroke: #c7cde0;
+                                    stroke-width: 2px;
+                                    fill: transparent;
+                                }
+                                ta := TouchArea {
+                                    clicked => {
+                                        root.send();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if root.input-text == "": Text {
+                        x: 16px;
+                        y: 13px;
+                        text: "Сообщение агенту…";
+                        color: #4f586e;
+                        font-size: 17px;
+                    }
+                }
+            }
+        }
+    }
+
+    public function scroll-to-bottom() {
+        scroll.viewport-y = min(0px, scroll.visible-height - scroll.viewport-height);
+    }
+}
