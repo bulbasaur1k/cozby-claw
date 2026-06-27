@@ -97,6 +97,7 @@ export component AppWindow inherits Window {
     in property <bool> busy: false;
     in-out property <string> input-text;
     callback send();
+    callback interrupt();
 
     // Модалка запроса разрешения на инструмент.
     in property <bool> perm-open: false;
@@ -242,10 +243,14 @@ export component AppWindow inherits Window {
                             font-size: 17px;
                             wrap: word-wrap;
                             single-line: false;
-                            // Enter — отправить, Shift+Enter — перенос строки.
+                            // Enter — отправить, Shift+Enter — перенос, Esc — прервать ход.
                             key-pressed(event) => {
                                 if (event.text == Key.Return && !event.modifiers.shift) {
                                     root.send();
+                                    return EventResult.accept;
+                                }
+                                if (event.text == Key.Escape && root.busy) {
+                                    root.interrupt();
                                     return EventResult.accept;
                                 }
                                 return EventResult.reject;
@@ -258,7 +263,8 @@ export component AppWindow inherits Window {
                                 height: 36px;
                                 border-radius: 10px;
                                 background: ta.has-hover ? #2a3144 : #222838;
-                                Path {
+                                // Покой — стрелка «отправить»; занят — квадрат «стоп».
+                                if !root.busy: Path {
                                     width: 36px;
                                     height: 36px;
                                     viewbox-width: 36;
@@ -268,9 +274,21 @@ export component AppWindow inherits Window {
                                     stroke-width: 2px;
                                     fill: transparent;
                                 }
+                                if root.busy: Rectangle {
+                                    x: 12px;
+                                    y: 12px;
+                                    width: 12px;
+                                    height: 12px;
+                                    border-radius: 3px;
+                                    background: #c7cde0;
+                                }
                                 ta := TouchArea {
                                     clicked => {
-                                        root.send();
+                                        if (root.busy) {
+                                            root.interrupt();
+                                        } else {
+                                            root.send();
+                                        }
                                     }
                                 }
                             }

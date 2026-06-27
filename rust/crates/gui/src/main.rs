@@ -29,7 +29,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         from_agent,
         permission_reply,
         question_reply,
-        cancel: _cancel,
+        cancel,
     } = handle;
 
     let ui = AppWindow::new()?;
@@ -64,6 +64,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let _ = to_agent.send(UiToAgent::Prompt(text));
         });
     }
+
+    // Прерывание текущего хода (Esc / кнопка-стоп) — кооперативная отмена.
+    ui.on_interrupt(move || {
+        cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+    });
 
     // Ответы модалок воркеру (он блокируется в recv до ответа пользователя).
     {
