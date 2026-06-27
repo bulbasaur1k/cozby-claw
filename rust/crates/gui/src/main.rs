@@ -1,17 +1,19 @@
 //! cozby-claw-gui — нативный Slint fluid-GUI поверх агентного рантайма.
 //!
-//! Фаза 1: одна сессия — лента сообщений + ввод, fluid-оформление, фоновый ход
-//! агента со стримингом. Модалки прав/вопросов, вкладки/сессии, вложения и темы —
-//! следующие фазы.
+//! Мультиплексер: несколько сессий-вкладок, каждая со своим воркером, лентой и
+//! статусом; фоновые сессии продолжают выполняться. Стриминг коалесцирован,
+//! markdown-блоки кода, модалки прав/вопросов, прерывание хода (Esc/стоп).
 
 mod protocol;
 mod worker;
 
+use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use runtime::{PermissionMode, Session};
-use slint::{ComponentHandle, Model, ModelRc, SharedString, Timer, TimerMode, VecModel};
+use slint::{ComponentHandle, Model, ModelRc, SharedString, Timer, TimerMode, VecModel, Weak};
 
 use protocol::{Activity, AgentHandle, AgentToUi, UiToAgent};
 
@@ -23,29 +25,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_or_else(|| "claude-sonnet-4-6".to_string(), |slot| slot.model);
     let mode = PermissionMode::WorkspaceWrite;
 
-    let handle = worker::spawn_agent(model.clone(), mode, Session::new());
-    let AgentHandle {
-        to_agent,
-        from_agent,
-        permission_reply,
-        question_reply,
-        cancel,
-    } = handle;
-
     let ui = AppWindow::new()?;
-    ui.set_model_name(model.into());
+    ui.set_model_name(model.clone().into());
     ui.set_status("готов".into());
     if let Some(branch) = git_branch() {
         ui.set_branch(branch.into());
     }
 
-    let messages = Rc::new(VecModel::<Message>::default());
-    ui.set_messages(ModelRc::from(messages.clone()));
+    let state = Rc::new(RefCell::new(AppState::new(model, mode)));
+    apply_active(&ui, &state.borrow());
 
-    // Отправка запроса: читаем ввод, чистим поле, добавляем пузырь, шлём воркеру.
+    // Отправка запроса в активную сессию.
     {
         let ui_weak = ui.as_weak();
-        let messages = messages.clone();
+        let state = state.clone();
         ui.on_send(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             let text = ui.get_input_text().to_string().trim().to_string();
@@ -53,145 +46,159 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return;
             }
             ui.set_input_text(SharedString::new());
-            messages.push(Message {
+            let st = state.borrow();
+            let tab = &st.sessions[st.active];
+            tab.messages.push(Message {
                 role: "user".into(),
                 code: false,
                 text: text.clone().into(),
             });
-            ui.invoke_scroll_to_bottom();
+            let _ = tab.handle.to_agent.send(UiToAgent::Prompt(text));
             ui.set_busy(true);
             ui.set_status("думает…".into());
-            let _ = to_agent.send(UiToAgent::Prompt(text));
+            ui.invoke_scroll_to_bottom();
         });
     }
 
-    // Прерывание текущего хода (Esc / кнопка-стоп) — кооперативная отмена.
-    ui.on_interrupt(move || {
-        cancel.store(true, std::sync::atomic::Ordering::SeqCst);
-    });
-
-    // Ответы модалок воркеру (он блокируется в recv до ответа пользователя).
+    // Прерывание активной сессии (Esc / стоп).
     {
-        let ui_weak = ui.as_weak();
-        let deny_tx = permission_reply.clone();
-        ui.on_perm_deny(move || {
-            let _ = deny_tx.send(false);
-            if let Some(ui) = ui_weak.upgrade() {
-                ui.set_perm_open(false);
-            }
-        });
-    }
-    {
-        let ui_weak = ui.as_weak();
-        ui.on_perm_allow(move || {
-            let _ = permission_reply.send(true);
-            if let Some(ui) = ui_weak.upgrade() {
-                ui.set_perm_open(false);
-            }
-        });
-    }
-    {
-        let ui_weak = ui.as_weak();
-        let skip_tx = question_reply.clone();
-        ui.on_q_skip(move || {
-            let _ = skip_tx.send(String::new());
-            if let Some(ui) = ui_weak.upgrade() {
-                ui.set_q_open(false);
-            }
-        });
-    }
-    {
-        let ui_weak = ui.as_weak();
-        ui.on_q_choose(move |opt| {
-            let _ = question_reply.send(opt.to_string());
-            if let Some(ui) = ui_weak.upgrade() {
-                ui.set_q_open(false);
-            }
+        let state = state.clone();
+        ui.on_interrupt(move || {
+            let st = state.borrow();
+            st.sessions[st.active]
+                .handle
+                .cancel
+                .store(true, Ordering::SeqCst);
         });
     }
 
-    // Дренаж событий воркера в UI (на потоке событий Slint, ~30 мс).
+    // Новая вкладка-сессия.
+    {
+        let ui_weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_new_tab(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            {
+                let mut st = state.borrow_mut();
+                let model = st.model.clone();
+                let mode = st.mode;
+                let id = st.next_id();
+                st.sessions.push(SessionTab::new(model, mode, id));
+                st.active = st.sessions.len() - 1;
+            }
+            apply_active(&ui, &state.borrow());
+        });
+    }
+
+    // Переключение вкладки.
+    {
+        let ui_weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_select_tab(move |idx| {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            {
+                let mut st = state.borrow_mut();
+                let idx = usize::try_from(idx).unwrap_or(0);
+                if idx < st.sessions.len() {
+                    st.active = idx;
+                }
+            }
+            apply_active(&ui, &state.borrow());
+        });
+    }
+
+    // Закрытие вкладки (последняя остаётся; drop сессии завершает её воркер).
+    {
+        let ui_weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_close_tab(move |idx| {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            {
+                let mut st = state.borrow_mut();
+                let idx = usize::try_from(idx).unwrap_or(0);
+                if st.sessions.len() > 1 && idx < st.sessions.len() {
+                    st.sessions.remove(idx);
+                    if st.active >= st.sessions.len() {
+                        st.active = st.sessions.len() - 1;
+                    } else if idx < st.active {
+                        st.active -= 1;
+                    }
+                }
+            }
+            apply_active(&ui, &state.borrow());
+        });
+    }
+
+    // Ответы модалок — той сессии, что их запросила.
+    {
+        let state = state.clone();
+        let ui_weak = ui.as_weak();
+        ui.on_perm_allow(move || reply_perm(&state, &ui_weak, true));
+    }
+    {
+        let state = state.clone();
+        let ui_weak = ui.as_weak();
+        ui.on_perm_deny(move || reply_perm(&state, &ui_weak, false));
+    }
+    {
+        let state = state.clone();
+        let ui_weak = ui.as_weak();
+        ui.on_q_skip(move || reply_question(&state, &ui_weak, String::new()));
+    }
+    {
+        let state = state.clone();
+        let ui_weak = ui.as_weak();
+        ui.on_q_choose(move |opt| reply_question(&state, &ui_weak, opt.to_string()));
+    }
+
+    // Дренаж событий ВСЕХ сессий (фоновые продолжают идти), ~30 мс.
     let timer = Timer::default();
     {
         let ui_weak = ui.as_weak();
-        let messages = messages.clone();
-        let mut in_tok: u64 = 0;
-        let mut out_tok: u64 = 0;
-        // Текущий стрим ответа: (индекс строки, роль, накопленный текст).
-        // Текст копится в Rust, а строка модели обновляется РАЗ В КАДР (анти-лаг).
-        let mut stream: Option<(usize, &'static str, String)> = None;
-        // Текущий процесс агента и момент его старта — для статуса «процесс · Ns».
-        let mut activity_label = String::new();
-        let mut turn_start: Option<Instant> = None;
-        let mut last_status = String::new();
+        let state = state.clone();
         timer.start(TimerMode::Repeated, Duration::from_millis(30), move || {
             let Some(ui) = ui_weak.upgrade() else { return };
-            let mut changed = false;
-            while let Ok(event) = from_agent.try_recv() {
-                changed = true;
-                match event {
-                    AgentToUi::Text(text) => accumulate(&messages, &mut stream, "assistant", &text),
-                    AgentToUi::Thinking(text) => {
-                        accumulate(&messages, &mut stream, "thinking", &text);
-                    }
-                    AgentToUi::Activity(activity) => {
-                        match activity {
-                            Activity::Idle => {
-                                turn_start = None;
-                                ui.set_busy(false);
-                                ui.set_status("готов".into());
-                                last_status.clear();
-                            }
-                            Activity::Model => {
-                                activity_label = "думает".into();
-                                turn_start.get_or_insert_with(Instant::now);
-                                ui.set_busy(true);
-                            }
-                            Activity::Tool { label } => {
-                                activity_label = label;
-                                turn_start.get_or_insert_with(Instant::now);
-                                ui.set_busy(true);
-                            }
-                            Activity::Waiting { label } => {
-                                activity_label = format!("ждёт: {label}");
-                                ui.set_busy(true);
-                            }
-                        }
-                    }
-                    AgentToUi::TurnDone => {
-                        finalize_blocks(&messages, &mut stream);
-                        turn_start = None;
-                        ui.set_busy(false);
-                        ui.set_status("готов".into());
-                        last_status.clear();
-                    }
-                    AgentToUi::Error(error) => {
-                        finalize_blocks(&messages, &mut stream);
-                        push(&messages, "error", &format!("✘ {error}"));
-                        turn_start = None;
-                        ui.set_busy(false);
-                        ui.set_status("ошибка".into());
-                        last_status.clear();
-                    }
-                    other => {
-                        // ToolCall / ToolResult / PermissionAsk / AskUser / Usage —
-                        // закрывают текущий ответ и пишут свою строку / открывают модалку.
-                        finalize_blocks(&messages, &mut stream);
-                        apply_event(&ui, &messages, &mut in_tok, &mut out_tok, other);
-                    }
+            let mut st = state.borrow_mut();
+            let active = st.active;
+            let mut tabs_dirty = false;
+            let mut active_changed = false;
+            let mut modal_for: Option<usize> = None;
+            for idx in 0..st.sessions.len() {
+                let was_busy = st.sessions[idx].busy;
+                let (changed, opened) = drain_session(&ui, &mut st.sessions[idx], idx == active);
+                if changed && idx == active {
+                    active_changed = true;
+                }
+                if st.sessions[idx].busy != was_busy {
+                    tabs_dirty = true;
+                }
+                if opened {
+                    modal_for = Some(idx);
                 }
             }
-            // Коалесцированное обновление строки стрима — один раз за кадр.
-            flush_stream(&messages, &mut stream);
-            // Живой статус «процесс · Ns» (как в Claude Code), пока агент работает.
-            if let Some(start) = turn_start {
-                let status = format!("{activity_label} · {}s", start.elapsed().as_secs());
-                if status != last_status {
+            // Живой статус активной сессии «процесс · Ns».
+            if let Some(start) = st.sessions[active].turn_start {
+                let label = st.sessions[active].activity_label.clone();
+                let status = format!("{label} · {}s", start.elapsed().as_secs());
+                if status != st.sessions[active].last_status {
                     ui.set_status(status.clone().into());
-                    last_status = status;
+                    st.sessions[active].last_status = status;
                 }
             }
-            if changed {
+            // Модалку запросила сессия `i` — она становится активной.
+            if let Some(i) = modal_for {
+                st.modal_session = Some(i);
+                if i != active {
+                    st.active = i;
+                    drop(st);
+                    apply_active(&ui, &state.borrow());
+                    return;
+                }
+            }
+            if tabs_dirty {
+                set_tabs(&ui, &st);
+            }
+            if active_changed {
                 ui.invoke_scroll_to_bottom();
             }
         });
@@ -201,54 +208,243 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Применяет одно событие воркера к UI-состоянию. Запросы прав/вопросы открывают
-/// модалку; ответ шлёт воркеру коллбэк модалки (см. `main`), а не эта функция.
-fn apply_event(
-    ui: &AppWindow,
-    messages: &VecModel<Message>,
-    in_tok: &mut u64,
-    out_tok: &mut u64,
-    event: AgentToUi,
-) {
-    match event {
-        // Стримовые события обрабатываются в таймере (коалесцированно); сюда не доходят.
-        AgentToUi::Text(_) | AgentToUi::Thinking(_) => {}
-        AgentToUi::ToolCall { name, input } => push(
-            messages,
-            "tool",
-            &format!("{name}   {}", first_line(&input, 160)),
-        ),
-        AgentToUi::ToolResult { output, is_error } => {
-            let role = if is_error { "error" } else { "system" };
-            push(messages, role, &format!("⎿ {}", first_line(&output, 200)));
+/// Одна сессия-вкладка: свой воркер, своя лента, своё состояние стрима/статуса.
+struct SessionTab {
+    handle: AgentHandle,
+    messages: Rc<VecModel<Message>>,
+    title: String,
+    stream: Option<(usize, &'static str, String)>,
+    in_tok: u64,
+    out_tok: u64,
+    activity_label: String,
+    turn_start: Option<Instant>,
+    last_status: String,
+    busy: bool,
+}
+
+impl SessionTab {
+    fn new(model: String, mode: PermissionMode, id: usize) -> Self {
+        Self {
+            handle: worker::spawn_agent(model, mode, Session::new()),
+            messages: Rc::new(VecModel::default()),
+            title: format!("Сессия {id}"),
+            stream: None,
+            in_tok: 0,
+            out_tok: 0,
+            activity_label: String::new(),
+            turn_start: None,
+            last_status: String::new(),
+            busy: false,
         }
-        AgentToUi::PermissionAsk {
-            tool_name,
-            input,
-            reason,
-        } => {
-            ui.set_perm_tool(tool_name.into());
-            ui.set_perm_input(first_line(&input, 240).into());
-            ui.set_perm_reason(reason.unwrap_or_default().into());
-            ui.set_perm_open(true);
-        }
-        AgentToUi::AskUser { question, options } => {
-            ui.set_q_text(question.into());
-            let opts: Vec<SharedString> = options.iter().map(|o| o.as_str().into()).collect();
-            ui.set_q_options(ModelRc::from(Rc::new(VecModel::from(opts))));
-            ui.set_q_open(true);
-        }
-        AgentToUi::Usage {
-            input_tokens,
-            output_tokens,
-        } => {
-            *in_tok += u64::from(input_tokens);
-            *out_tok += u64::from(output_tokens);
-            ui.set_usage(format!("{}k↑ {}k↓", *in_tok / 1000, *out_tok / 1000).into());
-        }
-        // Text/Thinking/Activity/TurnDone/Error обрабатываются в таймере.
-        _ => {}
     }
+}
+
+/// Состояние мультиплексера: набор сессий + активная + конфиг новых сессий.
+struct AppState {
+    sessions: Vec<SessionTab>,
+    active: usize,
+    model: String,
+    mode: PermissionMode,
+    next_id: usize,
+    /// Сессия, чью модалку прав/вопроса сейчас показывает UI.
+    modal_session: Option<usize>,
+}
+
+impl AppState {
+    fn new(model: String, mode: PermissionMode) -> Self {
+        let first = SessionTab::new(model.clone(), mode, 1);
+        Self {
+            sessions: vec![first],
+            active: 0,
+            model,
+            mode,
+            next_id: 2,
+            modal_session: None,
+        }
+    }
+
+    fn next_id(&mut self) -> usize {
+        let id = self.next_id;
+        self.next_id += 1;
+        id
+    }
+}
+
+/// Привязывает к UI активную сессию (лента, статус, токены) и таб-бар.
+fn apply_active(ui: &AppWindow, st: &AppState) {
+    let tab = &st.sessions[st.active];
+    ui.set_messages(ModelRc::from(tab.messages.clone()));
+    ui.set_busy(tab.busy);
+    ui.set_usage(format!("{}k↑ {}k↓", tab.in_tok / 1000, tab.out_tok / 1000).into());
+    ui.set_status(
+        if tab.busy {
+            tab.last_status.clone()
+        } else {
+            "готов".to_string()
+        }
+        .into(),
+    );
+    set_tabs(ui, st);
+    ui.invoke_scroll_to_bottom();
+}
+
+/// Перестраивает модель таб-бара из текущих сессий.
+fn set_tabs(ui: &AppWindow, st: &AppState) {
+    let infos: Vec<TabInfo> = st
+        .sessions
+        .iter()
+        .enumerate()
+        .map(|(i, s)| TabInfo {
+            title: s.title.as_str().into(),
+            busy: s.busy,
+            active: i == st.active,
+        })
+        .collect();
+    ui.set_tabs(ModelRc::from(Rc::new(VecModel::from(infos))));
+}
+
+fn reply_perm(state: &Rc<RefCell<AppState>>, ui_weak: &Weak<AppWindow>, allow: bool) {
+    let mut st = state.borrow_mut();
+    if let Some(i) = st.modal_session.take() {
+        if let Some(tab) = st.sessions.get(i) {
+            let _ = tab.handle.permission_reply.send(allow);
+        }
+    }
+    drop(st);
+    if let Some(ui) = ui_weak.upgrade() {
+        ui.set_perm_open(false);
+    }
+}
+
+fn reply_question(state: &Rc<RefCell<AppState>>, ui_weak: &Weak<AppWindow>, answer: String) {
+    let mut st = state.borrow_mut();
+    if let Some(i) = st.modal_session.take() {
+        if let Some(tab) = st.sessions.get(i) {
+            let _ = tab.handle.question_reply.send(answer);
+        }
+    }
+    drop(st);
+    if let Some(ui) = ui_weak.upgrade() {
+        ui.set_q_open(false);
+    }
+}
+
+/// Применяет события одной сессии к её ленте/состоянию. Для активной сессии также
+/// обновляет busy/usage в UI. Возвращает `(были_события, открыта_модалка)`.
+fn drain_session(ui: &AppWindow, tab: &mut SessionTab, active: bool) -> (bool, bool) {
+    let mut changed = false;
+    let mut opened_modal = false;
+    while let Ok(event) = tab.handle.from_agent.try_recv() {
+        changed = true;
+        match event {
+            AgentToUi::Text(text) => accumulate(&tab.messages, &mut tab.stream, "assistant", &text),
+            AgentToUi::Thinking(text) => {
+                accumulate(&tab.messages, &mut tab.stream, "thinking", &text);
+            }
+            AgentToUi::Activity(activity) => match activity {
+                Activity::Idle => {
+                    tab.turn_start = None;
+                    tab.busy = false;
+                    tab.last_status.clear();
+                    if active {
+                        ui.set_busy(false);
+                        ui.set_status("готов".into());
+                    }
+                }
+                Activity::Model => {
+                    tab.activity_label = "думает".into();
+                    tab.turn_start.get_or_insert_with(Instant::now);
+                    tab.busy = true;
+                    if active {
+                        ui.set_busy(true);
+                    }
+                }
+                Activity::Tool { label } => {
+                    tab.activity_label = label;
+                    tab.turn_start.get_or_insert_with(Instant::now);
+                    tab.busy = true;
+                    if active {
+                        ui.set_busy(true);
+                    }
+                }
+                Activity::Waiting { label } => {
+                    tab.activity_label = format!("ждёт: {label}");
+                    tab.busy = true;
+                    if active {
+                        ui.set_busy(true);
+                    }
+                }
+            },
+            AgentToUi::TurnDone => {
+                finalize_blocks(&tab.messages, &mut tab.stream);
+                tab.turn_start = None;
+                tab.busy = false;
+                tab.last_status.clear();
+                if active {
+                    ui.set_busy(false);
+                    ui.set_status("готов".into());
+                }
+            }
+            AgentToUi::Error(error) => {
+                finalize_blocks(&tab.messages, &mut tab.stream);
+                push(&tab.messages, "error", &format!("✘ {error}"));
+                tab.turn_start = None;
+                tab.busy = false;
+                tab.last_status.clear();
+                if active {
+                    ui.set_busy(false);
+                    ui.set_status("ошибка".into());
+                }
+            }
+            AgentToUi::ToolCall { name, input } => {
+                finalize_blocks(&tab.messages, &mut tab.stream);
+                push(
+                    &tab.messages,
+                    "tool",
+                    &format!("{name}   {}", first_line(&input, 160)),
+                );
+            }
+            AgentToUi::ToolResult { output, is_error } => {
+                finalize_blocks(&tab.messages, &mut tab.stream);
+                let role = if is_error { "error" } else { "system" };
+                push(&tab.messages, role, &format!("⎿ {}", first_line(&output, 200)));
+            }
+            AgentToUi::Usage {
+                input_tokens,
+                output_tokens,
+            } => {
+                tab.in_tok += u64::from(input_tokens);
+                tab.out_tok += u64::from(output_tokens);
+                if active {
+                    ui.set_usage(
+                        format!("{}k↑ {}k↓", tab.in_tok / 1000, tab.out_tok / 1000).into(),
+                    );
+                }
+            }
+            AgentToUi::PermissionAsk {
+                tool_name,
+                input,
+                reason,
+            } => {
+                finalize_blocks(&tab.messages, &mut tab.stream);
+                ui.set_perm_tool(tool_name.into());
+                ui.set_perm_input(first_line(&input, 240).into());
+                ui.set_perm_reason(reason.unwrap_or_default().into());
+                ui.set_perm_open(true);
+                opened_modal = true;
+            }
+            AgentToUi::AskUser { question, options } => {
+                finalize_blocks(&tab.messages, &mut tab.stream);
+                ui.set_q_text(question.into());
+                let opts: Vec<SharedString> = options.iter().map(|o| o.as_str().into()).collect();
+                ui.set_q_options(ModelRc::from(Rc::new(VecModel::from(opts))));
+                ui.set_q_open(true);
+                opened_modal = true;
+            }
+        }
+    }
+    flush_stream(&tab.messages, &mut tab.stream);
+    (changed, opened_modal)
 }
 
 /// Копит стримящийся текст в Rust-строке `stream` (без записи в модель на каждый

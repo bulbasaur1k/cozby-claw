@@ -8,6 +8,13 @@ export struct Message {
     text: string,
 }
 
+// Вкладка-сессия в таб-баре мультиплексера.
+export struct TabInfo {
+    title: string,
+    busy: bool,
+    active: bool,
+}
+
 component Entry {
     in property <string> role;
     in property <bool> code;
@@ -99,6 +106,12 @@ export component AppWindow inherits Window {
     callback send();
     callback interrupt();
 
+    // Вкладки-сессии (мультиплексер).
+    in property <[TabInfo]> tabs;
+    callback select-tab(int);
+    callback new-tab();
+    callback close-tab(int);
+
     // Модалка запроса разрешения на инструмент.
     in property <bool> perm-open: false;
     in property <string> perm-tool;
@@ -124,6 +137,95 @@ export component AppWindow inherits Window {
     }
 
     VerticalLayout {
+        // --- таб-бар (сессии мультиплексера) ---
+        Rectangle {
+            height: 38px;
+            HorizontalLayout {
+                padding-left: 10px;
+                padding-right: 10px;
+                padding-top: 6px;
+                padding-bottom: 4px;
+                spacing: 6px;
+                for tab[i] in root.tabs: Rectangle {
+                    width: 158px;
+                    border-radius: 8px;
+                    background: tab.active ? #1b1f2a : (chip-ta.has-hover ? #14171f : transparent);
+                    chip-ta := TouchArea {
+                        clicked => {
+                            root.select-tab(i);
+                        }
+                    }
+                    HorizontalLayout {
+                        padding-left: 10px;
+                        padding-right: 5px;
+                        spacing: 7px;
+                        VerticalLayout {
+                            alignment: center;
+                            Rectangle {
+                                width: 7px;
+                                height: 7px;
+                                border-radius: 3.5px;
+                                background: tab.busy ? #b59866 : #7f9a86;
+                            }
+                        }
+                        Text {
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                            text: tab.title;
+                            color: tab.active ? #d2d8e2 : #8a93a8;
+                            font-size: 13px;
+                            overflow: elide;
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            Rectangle {
+                                width: 18px;
+                                height: 18px;
+                                border-radius: 5px;
+                                background: close-ta.has-hover ? #2a3140 : transparent;
+                                Text {
+                                    text: "×";
+                                    color: #8a93a8;
+                                    font-size: 15px;
+                                }
+                                close-ta := TouchArea {
+                                    clicked => {
+                                        root.close-tab(i);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                VerticalLayout {
+                    alignment: center;
+                    Rectangle {
+                        width: 28px;
+                        height: 26px;
+                        border-radius: 7px;
+                        background: add-ta.has-hover ? #14171f : transparent;
+                        Text {
+                            text: "+";
+                            color: #8a93a8;
+                            font-size: 18px;
+                        }
+                        add-ta := TouchArea {
+                            clicked => {
+                                root.new-tab();
+                            }
+                        }
+                    }
+                }
+                Rectangle {
+                    horizontal-stretch: 1;
+                }
+            }
+        }
+        Rectangle {
+            height: 1px;
+            background: rgba(255, 255, 255, 0.05);
+        }
+
         // --- шапка ---
         Rectangle {
             height: 48px;
