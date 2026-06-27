@@ -1,0 +1,91 @@
+<svg width="100%" viewBox="0 0 1200 600" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t d">
+  <title id="t">cozby-claw</title>
+  <desc id="d">Flowing liquid marble of rainbow ribbons on a black background with neon glow and glossy highlights.</desc>
+  <defs>
+    <linearGradient id="g-purple" x1="0" y1="0" x2="1" y2="0.5">
+      <stop offset="0%" stop-color="#7c3aed"/>
+      <stop offset="50%" stop-color="#a855f7"/>
+      <stop offset="100%" stop-color="#2563eb"/>
+    </linearGradient>
+    <linearGradient id="g-cyan" x1="0" y1="0" x2="1" y2="0.4">
+      <stop offset="0%" stop-color="#0ea5e9"/>
+      <stop offset="50%" stop-color="#22d3ee"/>
+      <stop offset="100%" stop-color="#10b981"/>
+    </linearGradient>
+    <linearGradient id="g-warm" x1="0" y1="0" x2="1" y2="0.4">
+      <stop offset="0%" stop-color="#f97316"/>
+      <stop offset="50%" stop-color="#fb7185"/>
+      <stop offset="100%" stop-color="#d946ef"/>
+    </linearGradient>
+    <linearGradient id="g-violet" x1="0" y1="0" x2="1" y2="0.6">
+      <stop offset="0%" stop-color="#2563eb"/>
+      <stop offset="55%" stop-color="#8b5cf6"/>
+      <stop offset="100%" stop-color="#ec4899"/>
+    </linearGradient>
+    <linearGradient id="g-teal" x1="0" y1="0" x2="1" y2="0.5">
+      <stop offset="0%" stop-color="#14b8a6"/>
+      <stop offset="60%" stop-color="#38bdf8"/>
+      <stop offset="100%" stop-color="#6366f1"/>
+    </linearGradient>
+    <radialGradient id="halo" cx="38%" cy="45%" r="60%">
+      <stop offset="0%" stop-color="#6d28d9" stop-opacity="0.45"/>
+      <stop offset="45%" stop-color="#0ea5e9" stop-opacity="0.18"/>
+      <stop offset="100%" stop-color="#000000" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="scrim" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#04060c" stop-opacity="0.72"/>
+      <stop offset="70%" stop-color="#04060c" stop-opacity="0.35"/>
+      <stop offset="100%" stop-color="#04060c" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="liquid" x="-20%" y="-40%" width="140%" height="180%">
+      <feTurbulence type="fractalNoise" baseFrequency="0.008 0.014" numOctaves="2" seed="11" result="n"/>
+      <feDisplacementMap in="SourceGraphic" in2="n" scale="40" xChannelSelector="R" yChannelSelector="G"/>
+    </filter>
+    <filter id="soft" x="-30%" y="-60%" width="160%" height="220%">
+      <feGaussianBlur stdDeviation="10"/>
+    </filter>
+    <filter id="big" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="60"/>
+    </filter>
+    <filter id="glow" x="-60%" y="-160%" width="220%" height="420%">
+      <feGaussianBlur stdDeviation="3.5" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+
+  <rect width="1200" height="600" fill="#04060c"/>
+  <rect width="1200" height="600" fill="url(#halo)" filter="url(#big)" opacity="0.9"/>
+
+  <g filter="url(#liquid)">
+    <g filter="url(#soft)">
+      <path d="M-60 210 C220 120 420 270 660 190 C900 110 1060 250 1260 170 L1260 256 C1060 336 900 196 660 276 C420 356 220 206 -60 296 Z" fill="url(#g-violet)" opacity="0.8"/>
+      <path d="M-60 300 C200 230 430 380 680 290 C930 200 1090 350 1260 270 L1260 352 C1090 440 930 290 680 380 C430 470 200 320 -60 392 Z" fill="url(#g-teal)" opacity="0.78"/>
+      <path d="M-60 360 C230 290 440 430 690 350 C940 268 1100 410 1260 330 L1260 408 C1100 496 940 350 690 440 C440 528 230 380 -60 446 Z" fill="url(#g-cyan)" opacity="0.74"/>
+      <path d="M-60 430 C220 360 460 510 700 420 C950 330 1110 470 1260 400 L1260 486 C1110 576 950 426 700 516 C460 606 220 470 -60 520 Z" fill="url(#g-warm)" opacity="0.7"/>
+      <path d="M-60 170 C240 100 420 220 640 160 C880 96 1040 200 1260 140 L1260 206 C1040 268 880 156 640 226 C420 296 240 168 -60 246 Z" fill="url(#g-purple)" opacity="0.66"/>
+    </g>
+  </g>
+
+  <g fill="none" filter="url(#glow)" stroke-linecap="round">
+    <path d="M-40 198 C230 112 430 258 665 182 C905 104 1060 244 1255 164" stroke="#e9d5ff" stroke-width="2.5" opacity="0.7"/>
+    <path d="M-40 318 C210 246 435 392 682 304 C928 216 1090 362 1255 284" stroke="#a5f3fc" stroke-width="2.5" opacity="0.72"/>
+    <path d="M-40 440 C220 372 460 516 700 428 C950 340 1108 478 1255 410" stroke="#fecdd3" stroke-width="2" opacity="0.62"/>
+    <path d="M-40 372 C230 302 442 442 690 360 C940 280 1098 420 1255 342" stroke="#ffffff" stroke-width="1.4" opacity="0.55"/>
+  </g>
+
+  <g filter="url(#glow)">
+    <circle cx="980" cy="150" r="4" fill="#67e8f9"/>
+    <circle cx="1060" cy="300" r="5" fill="#f0abfc"/>
+    <circle cx="900" cy="470" r="4" fill="#fdba74"/>
+    <circle cx="140" cy="250" r="4" fill="#c4b5fd"/>
+    <circle cx="220" cy="470" r="5" fill="#7dd3fc"/>
+    <circle cx="1140" cy="220" r="3" fill="#ffffff"/>
+    <circle cx="80" cy="360" r="3" fill="#86efac"/>
+  </g>
+
+  <ellipse cx="600" cy="305" rx="430" ry="150" fill="url(#scrim)"/>
+  <g font-family="'Helvetica Neue',Arial,sans-serif" text-anchor="middle" filter="url(#glow)">
+    <text x="600" y="300" fill="#f1f5f9" font-size="82" font-weight="600" letter-spacing="2">cozby-claw</text>
+    <text x="600" y="346" fill="#7dd3fc" font-size="22" font-weight="400" letter-spacing="6">локальный кодинг-агент на rust</text>
+  </g>
+</svg>

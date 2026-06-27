@@ -1,7 +1,7 @@
 # cozby-claw
 
 <p align="center">
-  <img src="assets/clawd-hero.jpeg" alt="cozby-claw" width="300" />
+  <img src="assets/hero.svg" alt="cozby-claw" width="720" />
 </p>
 
 Консольный агент для программирования на чистом Rust — чистый форк, предназначенный для **изолированных (air-gapped) развёртываний с локальными LLM** внутри закрытых корпоративных сетей.
