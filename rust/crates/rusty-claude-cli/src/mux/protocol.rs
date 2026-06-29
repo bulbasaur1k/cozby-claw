@@ -9,14 +9,19 @@ use serde::{Deserialize, Serialize};
 pub enum Request {
     /// Проверка живости сервера.
     Ping,
-    /// Завести сессию-агента в рабочей директории `cwd`.
+    /// Завести сессию-агента в рабочей директории `cwd` (опц. сразу с промптом).
     New {
         cwd: String,
         title: Option<String>,
+        prompt: Option<String>,
     },
     /// Список всех сессий со статусами.
     List,
-    /// Закрыть сессию по id.
+    /// Отправить промпт агенту сессии.
+    Prompt { id: String, text: String },
+    /// Прочитать накопленный транскрипт сессии.
+    Logs { id: String },
+    /// Закрыть сессию по id (убивает дочерний процесс).
     Close { id: String },
     /// Остановить сервер (когда сессий не осталось/по запросу).
     Shutdown,
@@ -29,6 +34,7 @@ pub enum Response {
     Ok,
     Created { id: String },
     Sessions { sessions: Vec<SessionInfo> },
+    Logs { text: String },
     Error { message: String },
 }
 
