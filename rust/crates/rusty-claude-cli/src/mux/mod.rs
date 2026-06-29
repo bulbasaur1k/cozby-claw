@@ -41,10 +41,7 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         Some("send") => cmd_send(&socket, &args[1..]),
         Some("logs") => cmd_logs(&socket, args.get(1).map(String::as_str)),
         Some("close") => cmd_close(&socket, args.get(1).map(String::as_str)),
-        Some("attach") => {
-            println!("attach появится на следующем этапе (интерактивный стриминг)");
-            Ok(())
-        }
+        Some("attach") => cmd_attach(&socket, args.get(1).map(String::as_str)),
         Some(other) => {
             eprintln!("неизвестная команда mux: {other}");
             print_usage();
@@ -123,6 +120,20 @@ fn cmd_send(socket: &std::path::Path, args: &[String]) -> Result<(), Box<dyn std
         Response::Error { message } => eprintln!("ошибка: {message}"),
         other => eprintln!("неожиданный ответ: {other:?}"),
     }
+    Ok(())
+}
+
+fn cmd_attach(
+    socket: &std::path::Path,
+    id: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(id) = id else {
+        eprintln!("использование: cozby-claw-cli mux attach <id>");
+        return Ok(());
+    };
+    eprintln!("— подключено к {id}; Ctrl-D — detach (агент продолжит в фоне) —");
+    client::attach(socket, id)?;
+    eprintln!("\n— отключено от {id} —");
     Ok(())
 }
 

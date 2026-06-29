@@ -1,7 +1,8 @@
 //! Клиент мультиплексера: подключается к сокету, при необходимости поднимает
 //! фоновый сервер (детачится от клиента) и шлёт один запрос за соединение.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -69,4 +70,55 @@ pub fn request(socket_path: &Path, req: &Request) -> std::io::Result<Response> {
     reader.read_line(&mut line)?;
     serde_json::from_str(line.trim())
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+}
+
+/// Подключается к сессии: вывод агента → stdout, строки stdin → агенту.
+/// Завершается по Ctrl-D (EOF на stdin) — сессия продолжает работать на сервере.
+///
+/// # Errors
+/// Ошибки запуска сервера, соединения или сериализации запроса.
+pub fn attach(socket_path: &Path, id: &str) -> std::io::Result<()> {
+    ensure_running(socket_path)?;
+    let stream = UnixStream::connect(socket_path)?;
+    let mut writer = stream.try_clone()?;
+    let payload = serde_json::to_string(&Request::Attach { id: id.to_string() })?;
+    writeln!(writer, "{payload}")?;
+    writer.flush()?;
+
+    // Поток сервера → stdout.
+    let mut read_stream = stream.try_clone()?;
+    let reader = std::thread::spawn(move || {
+        let mut chunk = [0u8; 4096];
+        let mut stdout = std::io::stdout();
+        loop {
+            match read_stream.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(read) => {
+                    if stdout.write_all(&chunk[..read]).is_err() {
+                        break;
+                    }
+                    let _ = stdout.flush();
+                }
+            }
+        }
+    });
+
+    // stdin клиента (строки) → серверу как промпты, пока не Ctrl-D.
+    let stdin = std::io::stdin();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match stdin.read_line(&mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {
+                if writer.write_all(line.as_bytes()).is_err() {
+                    break;
+                }
+                let _ = writer.flush();
+            }
+        }
+    }
+    let _ = stream.shutdown(Shutdown::Both);
+    let _ = reader.join();
+    Ok(())
 }

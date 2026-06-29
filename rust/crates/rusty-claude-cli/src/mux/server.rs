@@ -16,7 +16,8 @@ use super::protocol::{Request, Response, SessionInfo};
 /// Максимум хранимого транскрипта на сессию (хвост), байт.
 const MAX_BUFFER: usize = 200_000;
 
-/// Одна сессия-агент: дочерний процесс + его stdin + буфер вывода + статус.
+/// Одна сессия-агент: дочерний процесс + stdin + буфер вывода + статус +
+/// подписчики (attach-соединения), которым транслируется вывод агента.
 struct Session {
     id: String,
     title: String,
@@ -25,6 +26,7 @@ struct Session {
     stdin: Option<ChildStdin>,
     buffer: Arc<Mutex<String>>,
     status: Arc<Mutex<String>>,
+    subscribers: Arc<Mutex<Vec<UnixStream>>>,
 }
 
 impl Session {
@@ -40,11 +42,17 @@ impl Session {
         let stdin = child.stdin.take();
         let buffer = Arc::new(Mutex::new(String::new()));
         let status = Arc::new(Mutex::new("idle".to_string()));
+        let subscribers: Arc<Mutex<Vec<UnixStream>>> = Arc::new(Mutex::new(Vec::new()));
         if let Some(out) = child.stdout.take() {
-            spawn_reader(out, Arc::clone(&buffer), Some(Arc::clone(&status)));
+            spawn_reader(
+                out,
+                Arc::clone(&buffer),
+                Arc::clone(&subscribers),
+                Some(Arc::clone(&status)),
+            );
         }
         if let Some(err) = child.stderr.take() {
-            spawn_reader(err, Arc::clone(&buffer), None);
+            spawn_reader(err, Arc::clone(&buffer), Arc::clone(&subscribers), None);
         }
         Ok(Self {
             id,
@@ -54,6 +62,7 @@ impl Session {
             stdin,
             buffer,
             status,
+            subscribers,
         })
     }
 
@@ -97,11 +106,12 @@ impl Session {
     }
 }
 
-/// Читает поток дочернего процесса в буфер. При EOF, если задан `idle_status`,
-/// помечает сессию `idle` (дочерний вернулся к приглашению/завершился).
+/// Читает поток дочернего процесса: пишет в буфер, транслирует подписчикам
+/// (attach) и обновляет статус по приглашению REPL.
 fn spawn_reader(
     mut stream: impl Read + Send + 'static,
     buffer: Arc<Mutex<String>>,
+    subscribers: Arc<Mutex<Vec<UnixStream>>>,
     idle_status: Option<Arc<Mutex<String>>>,
 ) {
     thread::spawn(move || {
@@ -110,7 +120,8 @@ fn spawn_reader(
             match stream.read(&mut chunk) {
                 Ok(0) | Err(_) => break,
                 Ok(read) => {
-                    let text = String::from_utf8_lossy(&chunk[..read]);
+                    let bytes = &chunk[..read];
+                    let text = String::from_utf8_lossy(bytes);
                     if let Ok(mut buffer) = buffer.lock() {
                         buffer.push_str(&text);
                         if buffer.len() > MAX_BUFFER {
@@ -118,8 +129,11 @@ fn spawn_reader(
                             buffer.drain(..cut);
                         }
                     }
-                    // Приглашение REPL (символ `›`) без перевода строки = агент
-                    // снова ждёт ввода → сессия в покое.
+                    // Транслируем подписчикам; отвалившихся (ошибка записи) убираем.
+                    if let Ok(mut subs) = subscribers.lock() {
+                        subs.retain_mut(|sub| sub.write_all(bytes).and_then(|()| sub.flush()).is_ok());
+                    }
+                    // Приглашение REPL (символ `›`) = агент снова ждёт ввода.
                     if let Some(status) = &idle_status {
                         if text.contains('\u{203A}') {
                             *status.lock().expect("status lock") = "idle".to_string();
@@ -202,7 +216,7 @@ pub fn serve(socket_path: &Path) -> std::io::Result<()> {
         let Ok(stream) = stream else { continue };
         let conn_state = Arc::clone(&state);
         let conn_shutdown = Arc::clone(&shutdown);
-        thread::spawn(move || handle_conn(&stream, &conn_state, &conn_shutdown));
+        thread::spawn(move || handle_conn(stream, conn_state, conn_shutdown));
         if shutdown.load(Ordering::SeqCst) {
             break;
         }
@@ -211,7 +225,7 @@ pub fn serve(socket_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn handle_conn(stream: &UnixStream, state: &Mutex<Mux>, shutdown: &AtomicBool) {
+fn handle_conn(stream: UnixStream, state: Arc<Mutex<Mux>>, shutdown: Arc<AtomicBool>) {
     let Ok(reader_stream) = stream.try_clone() else {
         return;
     };
@@ -220,18 +234,67 @@ fn handle_conn(stream: &UnixStream, state: &Mutex<Mux>, shutdown: &AtomicBool) {
     if reader.read_line(&mut line).is_err() || line.trim().is_empty() {
         return;
     }
-    let response = match serde_json::from_str::<Request>(line.trim()) {
-        Ok(request) => process(request, state, shutdown),
-        Err(error) => Response::Error {
-            message: format!("bad request: {error}"),
-        },
+    let request = match serde_json::from_str::<Request>(line.trim()) {
+        Ok(request) => request,
+        Err(error) => {
+            let mut writer = &stream;
+            let _ = writeln!(writer, "bad request: {error}");
+            return;
+        }
     };
-    let mut writer = stream;
+    // Attach переводит соединение в потоковый режим — обычного ответа нет.
+    if let Request::Attach { id } = &request {
+        handle_attach(&stream, id, &state);
+        return;
+    }
+    let response = process(request, &state, &shutdown);
+    let mut writer = &stream;
     let payload = serde_json::to_string(&response).unwrap_or_else(|_| {
         "{\"resp\":\"error\",\"message\":\"serialize failed\"}".to_string()
     });
     let _ = writeln!(writer, "{payload}");
     let _ = writer.flush();
+}
+
+/// Потоковый режим: транслируем вывод сессии клиенту и шлём его строки агенту.
+/// Завершается, когда клиент отсоединился (EOF) — сессия продолжает работать.
+fn handle_attach(stream: &UnixStream, id: &str, state: &Arc<Mutex<Mux>>) {
+    {
+        let mut mux = state.lock().expect("mux lock");
+        match mux.session_mut(id) {
+            Some(session) => {
+                // Реплей текущего транскрипта + подписка на будущий вывод.
+                let replay = session.buffer.lock().expect("buffer lock").clone();
+                if let Ok(mut writer) = stream.try_clone() {
+                    let _ = writer.write_all(replay.as_bytes());
+                    let _ = writer.flush();
+                }
+                if let Ok(sub) = stream.try_clone() {
+                    session.subscribers.lock().expect("subs lock").push(sub);
+                }
+            }
+            None => {
+                let mut writer = stream;
+                let _ = writeln!(writer, "no session {id}");
+                return;
+            }
+        }
+    }
+    // Ввод клиента (строки) → промпты агенту, пока клиент не отсоединится.
+    let Ok(reader_stream) = stream.try_clone() else {
+        return;
+    };
+    for line in BufReader::new(reader_stream).lines() {
+        let Ok(line) = line else { break };
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(mut mux) = state.lock() {
+            if let Some(session) = mux.session_mut(id) {
+                let _ = session.send_prompt(&line);
+            }
+        }
+    }
 }
 
 fn process(request: Request, state: &Mutex<Mux>, shutdown: &AtomicBool) -> Response {
@@ -286,5 +349,9 @@ fn process(request: Request, state: &Mutex<Mux>, shutdown: &AtomicBool) -> Respo
             shutdown.store(true, Ordering::SeqCst);
             Response::Ok
         }
+        // Attach обрабатывается в handle_conn (потоковый режим) и сюда не доходит.
+        Request::Attach { .. } => Response::Error {
+            message: "attach is a streaming request".to_string(),
+        },
     }
 }
