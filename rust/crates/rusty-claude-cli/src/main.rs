@@ -8,6 +8,7 @@
 )]
 mod init;
 mod input;
+mod mux;
 mod render;
 
 use std::collections::BTreeSet;
@@ -147,6 +148,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             allowed_tools,
             permission_mode,
         } => run_repl(model, allowed_tools, permission_mode)?,
+        CliAction::Mux { args } => mux::run(&args)?,
         CliAction::Help => print_help(),
     }
     Ok(())
@@ -202,6 +204,9 @@ enum CliAction {
         model: String,
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
+    },
+    Mux {
+        args: Vec<String>,
     },
     // prompt-mode formatting is only supported for non-interactive runs
     Help,
@@ -385,6 +390,9 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         }),
         "system-prompt" => parse_system_prompt_args(&rest[1..]),
         "hook" => parse_hook_args(&rest[1..]),
+        "mux" => Ok(CliAction::Mux {
+            args: rest[1..].to_vec(),
+        }),
         "login" => Ok(CliAction::Login),
         "logout" => Ok(CliAction::Logout),
         "init" => Ok(CliAction::Init),
