@@ -1542,6 +1542,15 @@ fn parse_session_command(args: &[&str]) -> Result<SlashCommand, SlashCommandPars
             target: None,
         }),
         ["new", ..] => Err(usage_error("session new", "")),
+        ["close"] => Ok(SlashCommand::Session {
+            action: Some("close".to_string()),
+            target: None,
+        }),
+        ["close", target] => Ok(SlashCommand::Session {
+            action: Some("close".to_string()),
+            target: Some((*target).to_string()),
+        }),
+        ["close", ..] => Err(usage_error("session close", "[#|session-id]")),
         ["switch"] => Err(usage_error("session switch", "<#|session-id>")),
         ["switch", target] => Ok(SlashCommand::Session {
             action: Some("switch".to_string()),

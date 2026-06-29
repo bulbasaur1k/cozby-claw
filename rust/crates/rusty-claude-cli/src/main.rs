@@ -1799,6 +1799,7 @@ fn run_repl(
 
     loop {
         editor.set_completions(cli.repl_completion_candidates().unwrap_or_default());
+        editor.set_prompt(cli.repl_prompt());
         match editor.read_line()? {
             input::ReadOutcome::Submit(input) => {
                 let trimmed = input.trim().to_string();
@@ -2438,6 +2439,17 @@ impl LiveCli {
             self.session.id,
             session_path,
         )
+    }
+
+    /// Приглашение REPL с активной сессией: `[title] › ` (для мультиплексера).
+    fn repl_prompt(&self) -> String {
+        match session_title(self.runtime.session()) {
+            Some(title) => {
+                let short: String = title.chars().take(20).collect();
+                format!("[{short}] › ")
+            }
+            None => "› ".to_string(),
+        }
     }
 
     fn repl_completion_candidates(&self) -> Result<Vec<String>, Box<dyn std::error::Error>> {
@@ -3191,9 +3203,67 @@ impl LiveCli {
                 );
                 Ok(true)
             }
+            Some("close") => {
+                let target_id = match target {
+                    None => self.session.id.clone(),
+                    Some(value) => match value.parse::<usize>() {
+                        Ok(index) => {
+                            let sessions = list_managed_sessions()?;
+                            match index.checked_sub(1).and_then(|i| sessions.get(i)) {
+                                Some(summary) => summary.id.clone(),
+                                None => {
+                                    println!("No session #{index}. Use /session list.");
+                                    return Ok(false);
+                                }
+                            }
+                        }
+                        Err(_) => value.to_string(),
+                    },
+                };
+                let handle = resolve_session_reference(&target_id)?;
+                let was_active = handle.id == self.session.id;
+                let _ = fs::remove_file(&handle.path);
+                println!("Session closed: {}", handle.id);
+                if was_active {
+                    // Активную закрыли — переходим к последней оставшейся или к новой.
+                    let next = list_managed_sessions()?.into_iter().next();
+                    let (session, handle) = match next {
+                        Some(summary) => {
+                            let session = Session::load_from_path(&summary.path)?;
+                            let handle = SessionHandle {
+                                id: session.session_id.clone(),
+                                path: summary.path,
+                            };
+                            (session, handle)
+                        }
+                        None => {
+                            let session = Session::new();
+                            let handle = create_managed_session_handle(&session.session_id)?;
+                            let session = session.with_persistence_path(handle.path.clone());
+                            session.save_to_path(&handle.path)?;
+                            (session, handle)
+                        }
+                    };
+                    let runtime = build_runtime(
+                        session,
+                        &handle.id,
+                        self.model.clone(),
+                        self.system_prompt.clone(),
+                        true,
+                        true,
+                        self.allowed_tools.clone(),
+                        self.permission_mode,
+                        None,
+                    )?;
+                    self.replace_runtime(runtime)?;
+                    self.session = handle;
+                    println!("  Active session   {}", self.session.id);
+                }
+                Ok(true)
+            }
             Some(other) => {
                 println!(
-                    "Unknown /session action '{other}'. Use /session list, /session new, /session switch <#|session-id>, or /session fork [branch-name]."
+                    "Unknown /session action '{other}'. Use /session list, /session new, /session switch <#|session-id>, /session close [#|session-id], or /session fork [branch-name]."
                 );
                 Ok(false)
             }
