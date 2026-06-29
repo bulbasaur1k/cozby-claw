@@ -1850,6 +1850,28 @@ struct ManagedSessionSummary {
     message_count: usize,
     parent_session_id: Option<String>,
     branch_name: Option<String>,
+    /// Заголовок сессии — первое сообщение пользователя (для списка вкладок).
+    title: Option<String>,
+}
+
+/// Первое непустое пользовательское сообщение сессии, обрезанное для заголовка.
+fn session_title(session: &Session) -> Option<String> {
+    session.messages.iter().find_map(|message| {
+        if !matches!(message.role, runtime::MessageRole::User) {
+            return None;
+        }
+        message.blocks.iter().find_map(|block| match block {
+            runtime::ContentBlock::Text { text } if !text.trim().is_empty() => {
+                let line = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+                Some(if line.chars().count() <= 48 {
+                    line.to_string()
+                } else {
+                    format!("{}…", line.chars().take(48).collect::<String>())
+                })
+            }
+            _ => None,
+        })
+    })
 }
 
 struct LiveCli {
@@ -2668,6 +2690,18 @@ impl LiveCli {
                 Self::print_skills(args.as_deref())?;
                 false
             }
+            SlashCommand::Usage { scope } => {
+                self.print_usage(scope.as_deref());
+                false
+            }
+            SlashCommand::Context { .. } => {
+                self.print_context();
+                false
+            }
+            SlashCommand::Copy { target } => {
+                self.copy_last_response(target.as_deref());
+                false
+            }
             SlashCommand::Doctor
             | SlashCommand::Login
             | SlashCommand::Logout
@@ -2695,11 +2729,8 @@ impl LiveCli {
             | SlashCommand::Tasks { .. }
             | SlashCommand::Theme { .. }
             | SlashCommand::Voice { .. }
-            | SlashCommand::Usage { .. }
             | SlashCommand::Rename { .. }
-            | SlashCommand::Copy { .. }
             | SlashCommand::Hooks { .. }
-            | SlashCommand::Context { .. }
             | SlashCommand::Color { .. }
             | SlashCommand::Effort { .. }
             | SlashCommand::Branch { .. }
@@ -2890,6 +2921,56 @@ impl LiveCli {
         println!("{}", format_cost_report(cumulative));
     }
 
+    /// `/usage` — разбивка токенов и стоимости: последний ход + вся сессия.
+    fn print_usage(&self, _scope: Option<&str>) {
+        let usage = self.runtime.usage();
+        println!("Token usage (model {}, turns {}):", self.model, usage.turns());
+        for line in usage
+            .current_turn_usage()
+            .summary_lines_for_model("  last turn", Some(&self.model))
+        {
+            println!("{line}");
+        }
+        for line in usage
+            .cumulative_usage()
+            .summary_lines_for_model("  session ", Some(&self.model))
+        {
+            println!("{line}");
+        }
+    }
+
+    /// `/context` — заполнение контекстного окна относительно порога авто-компакции.
+    fn print_context(&self) {
+        let usage = self.runtime.usage();
+        let threshold = runtime::auto_compaction_threshold_from_env();
+        let current_input = usage.current_turn_usage().input_tokens;
+        let pct = current_input.saturating_mul(100) / threshold.max(1);
+        println!("Context");
+        println!("  model              {}", self.model);
+        println!("  turns              {}", usage.turns());
+        println!("  last input tokens  {current_input}");
+        println!("  auto-compact at    {threshold} input tokens (~{pct}% used)");
+    }
+
+    /// `/copy` — копирует последний ответ ассистента в системный буфер обмена.
+    fn copy_last_response(&self, _target: Option<&str>) {
+        let text = last_assistant_text_from_session(self.runtime.session());
+        if text.trim().is_empty() {
+            println!("Nothing to copy yet.");
+            return;
+        }
+        match copy_to_clipboard(&text) {
+            Ok(()) => println!(
+                "Copied last response to clipboard ({} chars).",
+                text.chars().count()
+            ),
+            Err(error) => {
+                eprintln!("Clipboard unavailable ({error}); printing instead:\n");
+                println!("{text}");
+            }
+        }
+    }
+
     fn resume_session(
         &mut self,
         session_path: Option<String>,
@@ -3003,12 +3084,52 @@ impl LiveCli {
                 println!("{}", render_session_list(&self.session.id)?);
                 Ok(false)
             }
+            Some("new") => {
+                self.persist_session()?;
+                let session = Session::new();
+                let handle = create_managed_session_handle(&session.session_id)?;
+                let session = session.with_persistence_path(handle.path.clone());
+                session.save_to_path(&handle.path)?;
+                let runtime = build_runtime(
+                    session,
+                    &handle.id,
+                    self.model.clone(),
+                    self.system_prompt.clone(),
+                    true,
+                    true,
+                    self.allowed_tools.clone(),
+                    self.permission_mode,
+                    None,
+                )?;
+                self.replace_runtime(runtime)?;
+                self.session = handle;
+                println!(
+                    "New session\n  Active session   {}\n  File             {}",
+                    self.session.id,
+                    self.session.path.display(),
+                );
+                Ok(true)
+            }
             Some("switch") => {
                 let Some(target) = target else {
-                    println!("Usage: /session switch <session-id>");
+                    println!("Usage: /session switch <#|session-id>");
                     return Ok(false);
                 };
-                let handle = resolve_session_reference(target)?;
+                // Номер из /session list или прямой session-id.
+                let reference = match target.parse::<usize>() {
+                    Ok(index) => {
+                        let sessions = list_managed_sessions()?;
+                        match index.checked_sub(1).and_then(|i| sessions.get(i)) {
+                            Some(summary) => summary.id.clone(),
+                            None => {
+                                println!("No session #{index}. Use /session list.");
+                                return Ok(false);
+                            }
+                        }
+                    }
+                    Err(_) => target.to_string(),
+                };
+                let handle = resolve_session_reference(&reference)?;
                 let session = Session::load_from_path(&handle.path)?;
                 let message_count = session.messages.len();
                 let session_id = session.session_id.clone();
@@ -3072,7 +3193,7 @@ impl LiveCli {
             }
             Some(other) => {
                 println!(
-                    "Unknown /session action '{other}'. Use /session list, /session switch <session-id>, or /session fork [branch-name]."
+                    "Unknown /session action '{other}'. Use /session list, /session new, /session switch <#|session-id>, or /session fork [branch-name]."
                 );
                 Ok(false)
             }
@@ -3305,7 +3426,7 @@ fn list_managed_sessions() -> Result<Vec<ManagedSessionSummary>, Box<dyn std::er
             .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
             .map(|duration| duration.as_millis())
             .unwrap_or_default();
-        let (id, message_count, parent_session_id, branch_name) =
+        let (id, message_count, parent_session_id, branch_name, title) =
             match Session::load_from_path(&path) {
                 Ok(session) => {
                     let parent_session_id = session
@@ -3316,11 +3437,13 @@ fn list_managed_sessions() -> Result<Vec<ManagedSessionSummary>, Box<dyn std::er
                         .fork
                         .as_ref()
                         .and_then(|fork| fork.branch_name.clone());
+                    let title = session_title(&session);
                     (
                         session.session_id,
                         session.messages.len(),
                         parent_session_id,
                         branch_name,
+                        title,
                     )
                 }
                 Err(_) => (
@@ -3329,6 +3452,7 @@ fn list_managed_sessions() -> Result<Vec<ManagedSessionSummary>, Box<dyn std::er
                         .unwrap_or("unknown")
                         .to_string(),
                     0,
+                    None,
                     None,
                     None,
                 ),
@@ -3340,6 +3464,7 @@ fn list_managed_sessions() -> Result<Vec<ManagedSessionSummary>, Box<dyn std::er
             message_count,
             parent_session_id,
             branch_name,
+            title,
         });
     }
     sessions.sort_by(|left, right| {
@@ -3380,30 +3505,32 @@ fn render_session_list(active_session_id: &str) -> Result<String, Box<dyn std::e
         lines.push("  No managed sessions saved yet.".to_string());
         return Ok(lines.join("\n"));
     }
-    for session in sessions {
+    lines.push("  Switch with /session switch <#>.".to_string());
+    for (index, session) in sessions.iter().enumerate() {
         let marker = if session.id == active_session_id {
-            "● current"
+            "●"
         } else {
-            "○ saved"
+            "○"
         };
+        let title = session
+            .title
+            .clone()
+            .unwrap_or_else(|| "(empty)".to_string());
         let lineage = match (
             session.branch_name.as_deref(),
             session.parent_session_id.as_deref(),
         ) {
-            (Some(branch_name), Some(parent_session_id)) => {
-                format!(" branch={branch_name} from={parent_session_id}")
-            }
+            (Some(branch_name), _) => format!(" branch={branch_name}"),
             (None, Some(parent_session_id)) => format!(" from={parent_session_id}"),
-            (Some(branch_name), None) => format!(" branch={branch_name}"),
             (None, None) => String::new(),
         };
         lines.push(format!(
-            "  {id:<20} {marker:<10} msgs={msgs:<4} modified={modified}{lineage} path={path}",
-            id = session.id,
+            "  {marker} {n:<2} {title:<50} msgs={msgs:<4} {modified}{lineage}",
+            n = index + 1,
+            title = title,
             msgs = session.message_count,
             modified = format_session_modified_age(session.modified_epoch_millis),
             lineage = lineage,
-            path = session.path.display(),
         ));
     }
     Ok(lines.join("\n"))
@@ -5359,6 +5486,58 @@ fn final_assistant_text(summary: &runtime::TurnSummary) -> String {
                 .join("")
         })
         .unwrap_or_default()
+}
+
+/// Текст последнего assistant-сообщения из сессии (для `/copy`).
+fn last_assistant_text_from_session(session: &Session) -> String {
+    session
+        .messages
+        .iter()
+        .rev()
+        .find(|message| matches!(message.role, MessageRole::Assistant))
+        .map(|message| {
+            message
+                .blocks
+                .iter()
+                .filter_map(|block| match block {
+                    ContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("")
+        })
+        .unwrap_or_default()
+}
+
+/// Копирует текст в системный буфер обмена (pbcopy/clip/xclip).
+fn copy_to_clipboard(text: &str) -> Result<(), String> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let (program, args): (&str, &[&str]) = if cfg!(target_os = "macos") {
+        ("pbcopy", &[])
+    } else if cfg!(target_os = "windows") {
+        ("clip", &[])
+    } else {
+        ("xclip", &["-selection", "clipboard"])
+    };
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("{program}: {error}"))?;
+    child
+        .stdin
+        .as_mut()
+        .ok_or_else(|| "no stdin".to_string())?
+        .write_all(text.as_bytes())
+        .map_err(|error| error.to_string())?;
+    let status = child.wait().map_err(|error| error.to_string())?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("{program} exited with {status}"))
+    }
 }
 
 fn collect_tool_uses(summary: &runtime::TurnSummary) -> Vec<serde_json::Value> {

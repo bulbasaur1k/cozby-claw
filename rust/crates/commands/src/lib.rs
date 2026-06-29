@@ -1536,8 +1536,13 @@ fn parse_session_command(args: &[&str]) -> Result<SlashCommand, SlashCommandPars
             action: Some("list".to_string()),
             target: None,
         }),
-        ["list", ..] => Err(usage_error("session", "[list|switch <session-id>|fork [branch-name]]")),
-        ["switch"] => Err(usage_error("session switch", "<session-id>")),
+        ["list", ..] => Err(usage_error("session", "[list|new|switch <#|session-id>|fork [branch-name]]")),
+        ["new"] => Ok(SlashCommand::Session {
+            action: Some("new".to_string()),
+            target: None,
+        }),
+        ["new", ..] => Err(usage_error("session new", "")),
+        ["switch"] => Err(usage_error("session switch", "<#|session-id>")),
         ["switch", target] => Ok(SlashCommand::Session {
             action: Some("switch".to_string()),
             target: Some((*target).to_string()),
@@ -4035,7 +4040,7 @@ mod tests {
         let plugin_error = parse_error_message(plugin_input);
 
         // then
-        assert!(session_error.contains("Usage: /session switch <session-id>"));
+        assert!(session_error.contains("Usage: /session switch <#|session-id>"));
         assert!(session_error.contains("/session"));
         assert!(plugin_error.contains("Usage: /plugin list"));
         assert!(plugin_error.contains("Aliases          /plugins, /marketplace"));
