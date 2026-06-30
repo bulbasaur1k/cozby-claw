@@ -36,7 +36,11 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             server::serve(&socket)?;
             Ok(())
         }
-        None | Some("ls" | "list") => print_list(&socket),
+        None | Some("console") => {
+            client::console(&socket)?;
+            Ok(())
+        }
+        Some("ls" | "list") => print_list(&socket),
         Some("new") => cmd_new(&socket, &args[1..]),
         Some("send") => cmd_send(&socket, &args[1..]),
         Some("logs") => cmd_logs(&socket, args.get(1).map(String::as_str)),
