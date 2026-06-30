@@ -354,17 +354,36 @@ impl App {
                 self.push(Role::System, format!("тема: {}", self.theme.name));
                 true
             }
+            "memory" => {
+                self.run_report(crate::render_memory_report());
+                true
+            }
+            "diff" => {
+                self.run_report(crate::render_diff_report());
+                true
+            }
+            "config" => {
+                self.run_report(crate::render_config_report(parts.next()));
+                true
+            }
             "help" => {
                 self.push(
                     Role::System,
-                    "Команды: /clear /theme [name] /quit.  Клавиши: Enter — отправить, \
-                     Alt+Enter — строка, Esc — отмена хода, Ctrl+T — тема, Ctrl+L — очистить, \
-                     PgUp/PgDn — прокрутка. /memory, /skills и другое — следующим этапом."
+                    "Команды: /memory /diff /config [секция] /clear /theme [name] /quit.  \
+                     Клавиши: Enter — отправить, Alt+Enter — строка, Esc — отмена хода, \
+                     Ctrl+T — тема, Ctrl+L — очистить, PgUp/PgDn — прокрутка."
                         .to_string(),
                 );
                 true
             }
             _ => false,
+        }
+    }
+
+    fn run_report(&mut self, result: Result<String, Box<dyn std::error::Error>>) {
+        match result {
+            Ok(text) => self.push(Role::System, text),
+            Err(error) => self.push(Role::Error, error.to_string()),
         }
     }
 
@@ -517,11 +536,21 @@ impl App {
     fn draw_input(&mut self, frame: &mut Frame, area: Rect) {
         let theme = self.theme;
         let border = if self.running { theme.muted } else { theme.accent };
+        let typing_command = self
+            .input
+            .lines()
+            .first()
+            .is_some_and(|line| line.starts_with('/'));
+        let title = if typing_command {
+            " /memory · /diff · /config · /theme · /clear · /help · /quit "
+        } else {
+            " ввод "
+        };
         self.input.set_block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(border))
-                .title(Span::styled(" ввод ", Style::default().fg(theme.muted))),
+                .title(Span::styled(title, Style::default().fg(theme.muted))),
         );
         frame.render_widget(&self.input, area);
     }
