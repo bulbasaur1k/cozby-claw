@@ -5,6 +5,7 @@
 pub mod protocol;
 mod client;
 mod server;
+mod tui;
 
 use std::path::PathBuf;
 
@@ -36,7 +37,11 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             server::serve(&socket)?;
             Ok(())
         }
-        None | Some("console") => {
+        None | Some("tui") => {
+            tui::run(&socket)?;
+            Ok(())
+        }
+        Some("console") => {
             client::console(&socket)?;
             Ok(())
         }

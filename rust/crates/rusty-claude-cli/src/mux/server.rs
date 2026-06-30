@@ -27,6 +27,7 @@ struct Session {
     buffer: Arc<Mutex<String>>,
     status: Arc<Mutex<String>>,
     subscribers: Arc<Mutex<Vec<UnixStream>>>,
+    pinned: bool,
 }
 
 impl Session {
@@ -63,6 +64,7 @@ impl Session {
             buffer,
             status,
             subscribers,
+            pinned: false,
         })
     }
 
@@ -102,6 +104,7 @@ impl Session {
             cwd: self.cwd.clone(),
             status,
             msgs: 0,
+            pinned: self.pinned,
         }
     }
 }
@@ -170,7 +173,10 @@ impl Mux {
     }
 
     fn snapshot(&mut self) -> Vec<SessionInfo> {
-        self.sessions.iter_mut().map(Session::info).collect()
+        let mut infos: Vec<SessionInfo> = self.sessions.iter_mut().map(Session::info).collect();
+        // Закреплённые — первыми (стабильно, остальной порядок сохраняется).
+        infos.sort_by_key(|info| !info.pinned);
+        infos
     }
 
     fn session_mut(&mut self, id: &str) -> Option<&mut Session> {
@@ -331,6 +337,18 @@ fn process(request: Request, state: &Mutex<Mux>, shutdown: &AtomicBool) -> Respo
                 Some(session) => Response::Logs {
                     text: session.buffer.lock().expect("buffer lock").clone(),
                 },
+                None => Response::Error {
+                    message: format!("no session {id}"),
+                },
+            }
+        }
+        Request::Pin { id, pinned } => {
+            let mut mux = state.lock().expect("mux lock");
+            match mux.session_mut(&id) {
+                Some(session) => {
+                    session.pinned = pinned;
+                    Response::Ok
+                }
                 None => Response::Error {
                     message: format!("no session {id}"),
                 },

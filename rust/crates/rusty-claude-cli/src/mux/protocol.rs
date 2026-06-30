@@ -22,6 +22,8 @@ pub enum Request {
     Attach { id: String },
     /// Отправить промпт агенту сессии.
     Prompt { id: String, text: String },
+    /// Закрепить/открепить сессию (пины сортируются первыми).
+    Pin { id: String, pinned: bool },
     /// Прочитать накопленный транскрипт сессии.
     Logs { id: String },
     /// Закрыть сессию по id (убивает дочерний процесс).
@@ -50,4 +52,5 @@ pub struct SessionInfo {
     /// idle | working | waiting | done | error
     pub status: String,
     pub msgs: usize,
+    pub pinned: bool,
 }
