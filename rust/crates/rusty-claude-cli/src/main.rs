@@ -6,6 +6,7 @@
     clippy::unnecessary_wraps,
     clippy::unused_self
 )]
+mod appui;
 mod init;
 mod input;
 mod mux;
@@ -1800,6 +1801,11 @@ fn run_repl(
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // В интерактивном терминале запускаем полноэкранное приложение; в pipe-режиме
+    // (скрипты, дочерний процесс mux) остаёмся на строчном REPL.
+    if io::stdin().is_terminal() && io::stdout().is_terminal() {
+        return appui::run(effective_model(model), permission_mode);
+    }
     let mut cli = LiveCli::new(model, true, allowed_tools, permission_mode)?;
     let mut editor =
         input::LineEditor::new("> ", cli.repl_completion_candidates().unwrap_or_default());
