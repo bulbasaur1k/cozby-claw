@@ -18,10 +18,24 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 use runtime::{PermissionMode, Session};
-use tui_textarea::TextArea;
+use tui_textarea::{CursorMove, TextArea};
 
 use super::protocol::{Activity, AgentHandle, AgentToUi, UiToAgent};
 use super::worker;
+
+/// Слэш-команды для автодополнения.
+const COMMANDS: &[&str] = &[
+    "/memory", "/diff", "/config", "/theme", "/clear", "/help", "/quit",
+];
+
+/// Активное автодополнение: список кандидатов для текущего токена.
+struct Completion {
+    /// Char-индекс начала заменяемого токена в текущей строке.
+    start: usize,
+    row: usize,
+    items: Vec<String>,
+    selected: usize,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Role {
@@ -119,6 +133,7 @@ struct App {
     turn_start: Option<Instant>,
     frame_tick: usize,
     scroll_back: u16,
+    compl: Option<Completion>,
     handle: AgentHandle,
     should_quit: bool,
 }
@@ -172,6 +187,7 @@ impl App {
             turn_start: None,
             frame_tick: 0,
             scroll_back: 0,
+            compl: None,
             handle,
             should_quit: false,
         };
@@ -206,6 +222,7 @@ impl App {
                     Event::Key(key) if key.kind != KeyEventKind::Release => self.on_key(key),
                     Event::Paste(text) => {
                         self.input.insert_str(&text);
+                        self.recompute_completion();
                     }
                     Event::Resize(_, _) => {}
                     _ => continue,
@@ -225,6 +242,28 @@ impl App {
         if !matches!(self.modal, Modal::None) {
             self.on_modal_key(key);
             return;
+        }
+        // Активно автодополнение — навигация/принятие/закрытие.
+        if self.compl.is_some() {
+            match key.code {
+                KeyCode::Up => {
+                    self.compl_move(-1);
+                    return;
+                }
+                KeyCode::Down => {
+                    self.compl_move(1);
+                    return;
+                }
+                KeyCode::Tab | KeyCode::Enter => {
+                    self.accept_completion();
+                    return;
+                }
+                KeyCode::Esc => {
+                    self.compl = None;
+                    return;
+                }
+                _ => {}
+            }
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
@@ -258,6 +297,7 @@ impl App {
                 self.input.input(key);
             }
         }
+        self.recompute_completion();
     }
 
     fn on_modal_key(&mut self, key: KeyEvent) {
@@ -308,6 +348,74 @@ impl App {
         self.input.set_placeholder_text("Спросите что-нибудь…  (Enter — отправить, Alt+Enter — строка)");
         self.input.set_style(Style::default().fg(theme.text));
         self.input.set_cursor_line_style(Style::default());
+    }
+
+    // --- автодополнение -----------------------------------------------------
+
+    fn recompute_completion(&mut self) {
+        let (row, col) = self.input.cursor();
+        let line = self.input.lines().get(row).cloned().unwrap_or_default();
+        let chars: Vec<char> = line.chars().collect();
+        let col = col.min(chars.len());
+        let mut start = col;
+        while start > 0 && !chars[start - 1].is_whitespace() {
+            start -= 1;
+        }
+        let token: String = chars[start..col].iter().collect();
+        if start == 0 && token.starts_with('/') {
+            let partial = &token[1..];
+            let items: Vec<String> = COMMANDS
+                .iter()
+                .filter(|cmd| cmd[1..].starts_with(partial))
+                .map(|cmd| (*cmd).to_string())
+                .collect();
+            self.compl =
+                (!items.is_empty()).then_some(Completion { start, row, items, selected: 0 });
+        } else if let Some(partial) = token.strip_prefix('@') {
+            let items = file_completions(partial);
+            self.compl =
+                (!items.is_empty()).then_some(Completion { start, row, items, selected: 0 });
+        } else {
+            self.compl = None;
+        }
+    }
+
+    fn compl_move(&mut self, delta: i32) {
+        if let Some(compl) = self.compl.as_mut() {
+            let len = i32::try_from(compl.items.len()).unwrap_or(1).max(1);
+            let next = i32::try_from(compl.selected).unwrap_or(0) + delta;
+            compl.selected = usize::try_from(((next % len) + len) % len).unwrap_or(0);
+        }
+    }
+
+    fn accept_completion(&mut self) {
+        let Some(compl) = self.compl.take() else {
+            return;
+        };
+        let Some(item) = compl.items.get(compl.selected).cloned() else {
+            return;
+        };
+        let row = compl.row;
+        let mut lines: Vec<String> = self.input.lines().to_vec();
+        let Some(line) = lines.get(row).cloned() else {
+            return;
+        };
+        let chars: Vec<char> = line.chars().collect();
+        let (_, col) = self.input.cursor();
+        let col = col.min(chars.len());
+        let start = compl.start.min(chars.len());
+        let prefix: String = chars[..start].iter().collect();
+        let suffix: String = chars[col..].iter().collect();
+        lines[row] = format!("{prefix}{item}{suffix}");
+        let new_col = start + item.chars().count();
+        let mut input = TextArea::new(lines);
+        input.set_style(Style::default().fg(self.theme.text));
+        input.set_cursor_line_style(Style::default());
+        input.move_cursor(CursorMove::Jump(
+            u16::try_from(row).unwrap_or(0),
+            u16::try_from(new_col).unwrap_or(0),
+        ));
+        self.input = input;
     }
 
     fn submit(&mut self) {
@@ -477,9 +585,63 @@ impl App {
         self.draw_history(frame, layout[0]);
         self.draw_input(frame, layout[1]);
         self.draw_footer(frame, layout[2]);
+        if self.compl.is_some() {
+            self.draw_completion(frame, layout[1]);
+        }
         if !matches!(self.modal, Modal::None) {
             self.draw_modal(frame);
         }
+    }
+
+    fn draw_completion(&self, frame: &mut Frame, input_area: Rect) {
+        let Some(compl) = &self.compl else {
+            return;
+        };
+        let theme = self.theme;
+        let height = u16::try_from(compl.items.len() + 2).unwrap_or(10).min(10);
+        let longest = compl
+            .items
+            .iter()
+            .map(|item| item.chars().count())
+            .max()
+            .unwrap_or(12);
+        let width = u16::try_from(longest + 4)
+            .unwrap_or(24)
+            .clamp(16, input_area.width.saturating_sub(2).max(16));
+        let area = Rect {
+            x: input_area.x + 1,
+            y: input_area.y.saturating_sub(height),
+            width,
+            height,
+        };
+        frame.render_widget(Clear, area);
+        let visible = height.saturating_sub(2) as usize;
+        let start = compl.selected.saturating_sub(visible.saturating_sub(1));
+        let lines: Vec<Line> = compl
+            .items
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(visible)
+            .map(|(index, item)| {
+                let style = if index == compl.selected {
+                    Style::default().fg(theme.bar_bg).bg(theme.accent)
+                } else {
+                    Style::default().fg(theme.text)
+                };
+                Line::from(Span::styled(format!(" {item} "), style))
+            })
+            .collect();
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme.accent))
+            .title(Span::styled(" ↹/↑↓ ", Style::default().fg(theme.muted)));
+        frame.render_widget(
+            Paragraph::new(lines)
+                .block(block)
+                .style(Style::default().bg(theme.bar_bg)),
+            area,
+        );
     }
 
     fn draw_history(&mut self, frame: &mut Frame, area: Rect) {
@@ -674,6 +836,36 @@ fn short_path(path: &str) -> String {
         return format!("~{}", &path[home.len()..]);
     }
     path.to_string()
+}
+
+/// Кандидаты файлов/папок для токена после `@` (относительно cwd).
+fn file_completions(partial: &str) -> Vec<String> {
+    let (dir_part, name_part) = match partial.rfind('/') {
+        Some(index) => (&partial[..=index], &partial[index + 1..]),
+        None => ("", partial),
+    };
+    let base = std::env::current_dir().unwrap_or_default().join(dir_part);
+    let Ok(entries) = std::fs::read_dir(&base) else {
+        return Vec::new();
+    };
+    let mut items: Vec<String> = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') && !name_part.starts_with('.') {
+                return None;
+            }
+            if !name.starts_with(name_part) {
+                return None;
+            }
+            let is_dir = entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false);
+            let slash = if is_dir { "/" } else { "" };
+            Some(format!("@{dir_part}{name}{slash}"))
+        })
+        .collect();
+    items.sort();
+    items.truncate(20);
+    items
 }
 
 fn first_line(text: &str, max: usize) -> String {
