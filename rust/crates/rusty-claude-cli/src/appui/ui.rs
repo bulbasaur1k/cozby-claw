@@ -20,14 +20,13 @@ use ratatui::Frame;
 use runtime::{PermissionMode, Session};
 use tui_textarea::{CursorMove, TextArea};
 
+use super::icons;
 use super::protocol::{Activity, AgentHandle, AgentToUi, UiToAgent};
 use super::worker;
 
 const COMMANDS: &[&str] = &[
     "/memory", "/diff", "/config", "/theme", "/clear", "/help", "/quit",
 ];
-
-const SPINNER: [&str; 4] = ["◐", "◓", "◑", "◒"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Role {
@@ -231,6 +230,7 @@ struct App {
     input: TextArea<'static>,
     compl: Option<Completion>,
     frame_tick: usize,
+    sidebar_collapsed: bool,
     should_quit: bool,
 }
 
@@ -274,11 +274,13 @@ impl App {
             input,
             compl: None,
             frame_tick: 0,
+            sidebar_collapsed: false,
             should_quit: false,
         };
         app.active_mut().push(
             Role::System,
-            "cozby-claw. /help — команды, Ctrl+N — вкладка, Ctrl+←/→ — переключить, Ctrl+T — тема."
+            "cozby-claw. /help — команды, Ctrl+N — вкладка, Ctrl+F/Ctrl+B — переключить, \
+             Ctrl+E — свернуть сайдбар, Ctrl+T — тема."
                 .to_string(),
         );
         app
@@ -381,6 +383,9 @@ impl App {
             KeyCode::Char('n') if ctrl => self.new_tab(),
             KeyCode::Char('w') if ctrl => self.close_tab(),
             KeyCode::Char('p') if ctrl => self.toggle_pin(),
+            KeyCode::Char('e') if ctrl => self.sidebar_collapsed = !self.sidebar_collapsed,
+            KeyCode::Char('f') if ctrl => self.switch(1),
+            KeyCode::Char('b') if ctrl => self.switch(-1),
             KeyCode::Right if ctrl => self.switch(1),
             KeyCode::Left if ctrl => self.switch(-1),
             KeyCode::Char(c @ '1'..='9') if alt => {
@@ -527,6 +532,13 @@ impl App {
                 return;
             }
         }
+        // Первое сообщение задаёт название вкладки (как в Claude Code).
+        if !self.active().entries.iter().any(|e| e.role == Role::User) {
+            let title = first_line(&text, 24);
+            if !title.is_empty() {
+                self.active_mut().title = title;
+            }
+        }
         self.active_mut().push(Role::User, text.clone());
         let handle_tx = self.active().handle.to_agent.clone();
         let tab = self.active_mut();
@@ -575,8 +587,8 @@ impl App {
                 self.active_mut().push(
                     Role::System,
                     "Команды: /memory /diff /config [секция] /clear /theme [name] /quit.  \
-                     Вкладки: Ctrl+N новая · Ctrl+←/→ переключить · Alt+1..9 · Ctrl+W закрыть · \
-                     Ctrl+P пин.  Enter — отправить, Alt+Enter — строка, Esc — отмена хода."
+                     Вкладки: Ctrl+N новая · Ctrl+F/Ctrl+B переключить · Ctrl+W закрыть · \
+                     Ctrl+P пин · Ctrl+E свернуть сайдбар.  Enter — отправить, Alt+Enter — строка."
                         .to_string(),
                 );
                 true
@@ -668,46 +680,69 @@ impl App {
     // --- отрисовка ----------------------------------------------------------
 
     fn draw(&mut self, frame: &mut Frame) {
+        let sidebar_w = if self.sidebar_collapsed { 3 } else { 26 };
+        let outer = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(sidebar_w), Constraint::Min(20)])
+            .split(frame.area());
+        self.draw_sidebar(frame, outer[0]);
+
         let input_lines = u16::try_from(self.input.lines().len().clamp(1, 6)).unwrap_or(6);
-        let layout = Layout::default()
+        let main = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(1),
                 Constraint::Min(3),
                 Constraint::Length(input_lines + 2),
                 Constraint::Length(1),
             ])
-            .split(frame.area());
-        self.draw_tabbar(frame, layout[0]);
-        self.draw_history(frame, layout[1]);
-        self.draw_input(frame, layout[2]);
-        self.draw_footer(frame, layout[3]);
+            .split(outer[1]);
+        self.draw_history(frame, main[0]);
+        self.draw_input(frame, main[1]);
+        self.draw_footer(frame, main[2]);
         if self.compl.is_some() {
-            self.draw_completion(frame, layout[2]);
+            self.draw_completion(frame, main[1]);
         }
         if !matches!(self.active().modal, Modal::None) {
             self.draw_modal(frame);
         }
     }
 
-    fn draw_tabbar(&self, frame: &mut Frame, area: Rect) {
+    fn draw_sidebar(&self, frame: &mut Frame, area: Rect) {
         let theme = self.theme;
-        let mut spans = Vec::new();
+        let collapsed = self.sidebar_collapsed;
+        let inner = area.width.saturating_sub(2) as usize;
+        let mut rows = Vec::new();
         for (index, tab) in self.tabs.iter().enumerate() {
             let active = index == self.active;
-            let pin = if tab.pinned { "★" } else { "" };
-            let dot = tab_dot(tab);
-            let label = format!(" {pin}{} {} ", index + 1, short(&tab.title, 18));
             let color = tab_status_color(tab, theme);
-            let mut style = Style::default().fg(color);
-            if active {
-                style = style.bg(Color::Rgb(45, 49, 66)).add_modifier(Modifier::BOLD);
+            if collapsed {
+                let dot_color = if active { theme.accent } else { color };
+                rows.push(Line::from(Span::styled(
+                    icons::DOT,
+                    Style::default().fg(dot_color),
+                )));
+            } else {
+                let pin = if tab.pinned { icons::PIN } else { "" };
+                let title = short(&tab.title, inner.saturating_sub(6));
+                let mark = if active { icons::ACTIVE } else { " " };
+                let mut label_style = Style::default().fg(if active { theme.text } else { theme.muted });
+                if active {
+                    label_style = label_style.add_modifier(Modifier::BOLD);
+                }
+                rows.push(Line::from(vec![
+                    Span::styled(format!("{mark}"), Style::default().fg(theme.accent)),
+                    Span::styled(format!(" {} ", icons::DOT), Style::default().fg(color)),
+                    Span::styled(format!("{}{pin} {title}", index + 1), label_style),
+                ]));
             }
-            spans.push(Span::styled(format!("{dot}"), Style::default().fg(color)));
-            spans.push(Span::styled(label, style));
         }
+        let title = if collapsed { "" } else { " сессии " };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme.muted))
+            .title(Span::styled(title, Style::default().fg(theme.accent2)));
         frame.render_widget(
-            Paragraph::new(Line::from(spans)).style(Style::default().bg(theme.bar_bg)),
+            Paragraph::new(rows).block(block).style(Style::default().bg(theme.bar_bg)),
             area,
         );
     }
@@ -742,12 +777,12 @@ impl App {
         let mut lines = Vec::new();
         for entry in &self.active().entries {
             let (prefix, color, dim) = match entry.role {
-                Role::User => ("▌ ", theme.accent, false),
+                Role::User => ("▍ ", theme.accent, false),
                 Role::Assistant => ("", theme.text, false),
                 Role::Thinking => ("· ", theme.muted, true),
-                Role::Tool => ("⏺ ", theme.accent2, true),
+                Role::Tool => ("▹ ", theme.accent2, true),
                 Role::ToolResult => ("", theme.success, true),
-                Role::Error => ("✘ ", theme.error, false),
+                Role::Error => ("✗ ", theme.error, false),
                 Role::System => ("» ", theme.muted, true),
             };
             let mut style = Style::default().fg(color);
@@ -795,7 +830,7 @@ impl App {
     fn draw_footer(&self, frame: &mut Frame, area: Rect) {
         let theme = self.theme;
         let tab = self.active();
-        let spin = SPINNER[self.frame_tick % SPINNER.len()];
+        let spin = icons::SPINNER[self.frame_tick % icons::SPINNER.len()];
         let (icon, label, color) = match &tab.activity {
             Activity::Idle => ("●", "готов".to_string(), theme.success),
             Activity::Model => (spin, tab.elapsed_label("думает"), theme.working),
@@ -941,16 +976,6 @@ fn configure_input(input: &mut TextArea<'static>, theme: Theme) {
     input.set_style(Style::default().fg(theme.text));
     input.set_cursor_line_style(Style::default());
     input.set_placeholder_text("Спросите что-нибудь…  (Enter — отправить, Alt+Enter — строка)");
-}
-
-fn tab_dot(tab: &Tab) -> &'static str {
-    if !matches!(tab.modal, Modal::None) {
-        "🔴"
-    } else if tab.running {
-        "🟡"
-    } else {
-        "🟢"
-    }
 }
 
 fn tab_status_color(tab: &Tab, theme: Theme) -> Color {

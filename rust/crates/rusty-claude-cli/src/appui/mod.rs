@@ -3,6 +3,7 @@
 //! Запускается по умолчанию в интерактивном терминале; pipe/`prompt` остаются на
 //! строчном режиме.
 
+mod icons;
 mod protocol;
 mod ui;
 mod worker;
