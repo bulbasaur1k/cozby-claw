@@ -5,7 +5,7 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
@@ -17,7 +17,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
-use runtime::{PermissionMode, Session};
+use runtime::{ContentBlock, MessageRole, PermissionMode, Session};
 use tui_textarea::{CursorMove, TextArea};
 
 use super::icons;
@@ -128,18 +128,34 @@ struct Tab {
     turn_start: Option<Instant>,
     scroll_back: u16,
     pinned: bool,
+    save_path: Option<PathBuf>,
 }
 
 impl Tab {
     fn new(id: usize, model: &str, mode: PermissionMode) -> Self {
-        let session = Session::new();
+        Self::from_session(id, model, mode, Session::new(), None)
+    }
+
+    /// Строит вкладку из (новой или загруженной) сессии: восстанавливает историю
+    /// и заголовок, продолжает ту же сессию в воркере, сохраняет в тот же файл.
+    fn from_session(
+        id: usize,
+        model: &str,
+        mode: PermissionMode,
+        session: Session,
+        fallback_title: Option<String>,
+    ) -> Self {
         let save_path = sessions_path(&session.session_id);
-        let handle = worker::spawn_agent(model.to_string(), mode, session, save_path);
+        let title = title_from_session(&session)
+            .or(fallback_title)
+            .unwrap_or_else(|| format!("Сессия {id}"));
+        let entries = rebuild_entries(&session);
+        let handle = worker::spawn_agent(model.to_string(), mode, session, save_path.clone());
         Self {
             id,
-            title: format!("Сессия {id}"),
+            title,
             handle,
-            entries: Vec::new(),
+            entries,
             activity: Activity::Idle,
             running: false,
             modal: Modal::None,
@@ -149,6 +165,7 @@ impl Tab {
             turn_start: None,
             scroll_back: 0,
             pinned: false,
+            save_path,
         }
     }
 
@@ -261,28 +278,34 @@ impl App {
         let theme = THEMES[0];
         let mut input = TextArea::default();
         configure_input(&mut input, theme);
-        let first = Tab::new(1, &model, mode);
+        let mut tabs = load_recent_sessions(&model, mode);
+        if tabs.is_empty() {
+            tabs.push(Tab::new(1, &model, mode));
+        }
+        let next_id = tabs.len() + 1;
         let mut app = Self {
             theme,
             model,
             mode,
             cwd,
             branch: git_branch(),
-            tabs: vec![first],
+            tabs,
             active: 0,
-            next_id: 2,
+            next_id,
             input,
             compl: None,
             frame_tick: 0,
             sidebar_collapsed: false,
             should_quit: false,
         };
-        app.active_mut().push(
-            Role::System,
-            "cozby-claw. /help — команды, Ctrl+N — вкладка, Ctrl+F/Ctrl+B — переключить, \
-             Ctrl+E — свернуть сайдбар, Ctrl+T — тема."
-                .to_string(),
-        );
+        if app.active().entries.is_empty() {
+            app.active_mut().push(
+                Role::System,
+                "cozby-claw. /help — команды, Ctrl+N — вкладка, Ctrl+F/Ctrl+B — переключить, \
+                 Ctrl+E — свернуть сайдбар, Ctrl+T — тема."
+                    .to_string(),
+            );
+        }
         app
     }
 
@@ -492,7 +515,11 @@ impl App {
         if self.tabs.len() <= 1 {
             return;
         }
-        self.tabs.remove(self.active);
+        let tab = self.tabs.remove(self.active);
+        // Явное удаление вкладки убирает и сохранённую сессию с диска.
+        if let Some(path) = &tab.save_path {
+            let _ = std::fs::remove_file(path);
+        }
         if self.active >= self.tabs.len() {
             self.active = self.tabs.len() - 1;
         }
@@ -722,17 +749,22 @@ impl App {
                     Style::default().fg(dot_color),
                 )));
             } else {
-                let pin = if tab.pinned { icons::PIN } else { "" };
-                let title = short(&tab.title, inner.saturating_sub(6));
+                let pin = if tab.pinned {
+                    format!("{} ", icons::PIN)
+                } else {
+                    String::new()
+                };
+                let title = short(&tab.title, inner.saturating_sub(4));
                 let mark = if active { icons::ACTIVE } else { " " };
-                let mut label_style = Style::default().fg(if active { theme.text } else { theme.muted });
+                let mut label_style =
+                    Style::default().fg(if active { theme.text } else { theme.muted });
                 if active {
                     label_style = label_style.add_modifier(Modifier::BOLD);
                 }
                 rows.push(Line::from(vec![
-                    Span::styled(format!("{mark}"), Style::default().fg(theme.accent)),
+                    Span::styled(mark, Style::default().fg(theme.accent)),
                     Span::styled(format!(" {} ", icons::DOT), Style::default().fg(color)),
-                    Span::styled(format!("{}{pin} {title}", index + 1), label_style),
+                    Span::styled(format!("{pin}{title}"), label_style),
                 ]));
             }
         }
@@ -1011,6 +1043,89 @@ fn git_branch() -> Option<String> {
     }
     let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
     (!branch.is_empty()).then_some(branch)
+}
+
+/// Загружает до 8 последних непустых сессий из `.claw/sessions` текущего
+/// проекта (новые — первыми) как вкладки, восстанавливая историю.
+fn load_recent_sessions(model: &str, mode: PermissionMode) -> Vec<Tab> {
+    let Some(dir) = std::env::current_dir()
+        .ok()
+        .map(|cwd| cwd.join(".claw").join("sessions"))
+    else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut files: Vec<(SystemTime, PathBuf)> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+        .filter_map(|path| {
+            let mtime = std::fs::metadata(&path).and_then(|meta| meta.modified()).ok()?;
+            Some((mtime, path))
+        })
+        .collect();
+    files.sort_by(|a, b| b.0.cmp(&a.0));
+    files
+        .into_iter()
+        .filter_map(|(_, path)| Session::load_from_path(&path).ok())
+        .filter(|session| !session.messages.is_empty())
+        .take(8)
+        .enumerate()
+        .map(|(index, session)| Tab::from_session(index + 1, model, mode, session, None))
+        .collect()
+}
+
+/// Восстанавливает строки ленты из истории сессии.
+fn rebuild_entries(session: &Session) -> Vec<Entry> {
+    let mut out = Vec::new();
+    for message in &session.messages {
+        for block in &message.blocks {
+            match block {
+                ContentBlock::Text { text } => {
+                    if text.trim().is_empty() {
+                        continue;
+                    }
+                    match message.role {
+                        MessageRole::User => out.push(Entry {
+                            role: Role::User,
+                            text: text.clone(),
+                        }),
+                        MessageRole::Assistant => out.push(Entry {
+                            role: Role::Assistant,
+                            text: text.clone(),
+                        }),
+                        MessageRole::System | MessageRole::Tool => {}
+                    }
+                }
+                ContentBlock::ToolUse { name, input, .. } => out.push(Entry {
+                    role: Role::Tool,
+                    text: format!("{name}  {}", first_line(input, 200)),
+                }),
+                ContentBlock::ToolResult {
+                    output, is_error, ..
+                } => out.push(Entry {
+                    role: if *is_error { Role::Error } else { Role::ToolResult },
+                    text: format!("⎿ {}", first_line(output, 400)),
+                }),
+            }
+        }
+    }
+    out
+}
+
+/// Заголовок вкладки из первого пользовательского сообщения сессии.
+fn title_from_session(session: &Session) -> Option<String> {
+    session.messages.iter().find_map(|message| {
+        if message.role != MessageRole::User {
+            return None;
+        }
+        message.blocks.iter().find_map(|block| match block {
+            ContentBlock::Text { text } if !text.trim().is_empty() => Some(first_line(text, 24)),
+            _ => None,
+        })
+    })
 }
 
 fn short(text: &str, max: usize) -> String {
