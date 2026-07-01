@@ -25,7 +25,7 @@ use super::protocol::{Activity, AgentHandle, AgentToUi, UiToAgent};
 use super::worker;
 
 const COMMANDS: &[&str] = &[
-    "/memory", "/diff", "/config", "/theme", "/clear", "/help", "/quit",
+    "/model", "/memory", "/diff", "/config", "/theme", "/clear", "/help", "/quit",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -129,6 +129,8 @@ struct Tab {
     scroll_back: u16,
     pinned: bool,
     save_path: Option<PathBuf>,
+    model: String,
+    mode: PermissionMode,
 }
 
 impl Tab {
@@ -166,6 +168,8 @@ impl Tab {
             scroll_back: 0,
             pinned: false,
             save_path,
+            model: model.to_string(),
+            mode,
         }
     }
 
@@ -610,10 +614,29 @@ impl App {
                 self.run_report(crate::render_config_report(parts.next()));
                 true
             }
+            "model" => {
+                match parts.next() {
+                    None => {
+                        let current = self.active().model.clone();
+                        let hint = providers_hint();
+                        self.active_mut()
+                            .push(Role::System, format!("модель: {current}\n{hint}"));
+                    }
+                    Some(id) if self.active().running => {
+                        let _ = id;
+                        self.active_mut().push(
+                            Role::System,
+                            "дождитесь завершения хода, затем /model <id>".to_string(),
+                        );
+                    }
+                    Some(id) => self.switch_model(id),
+                }
+                true
+            }
             "help" => {
                 self.active_mut().push(
                     Role::System,
-                    "Команды: /memory /diff /config [секция] /clear /theme [name] /quit.  \
+                    "Команды: /model [id] /memory /diff /config [секция] /clear /theme [name] /quit.  \
                      Вкладки: Ctrl+N новая · Ctrl+F/Ctrl+B переключить · Ctrl+W закрыть · \
                      Ctrl+P пин · Ctrl+E свернуть сайдбар.  Enter — отправить, Alt+Enter — строка."
                         .to_string(),
@@ -629,6 +652,27 @@ impl App {
             Ok(text) => self.active_mut().push(Role::System, text),
             Err(error) => self.active_mut().push(Role::Error, error.to_string()),
         }
+    }
+
+    /// Переключает модель активной вкладки: перезапускает воркер на той же
+    /// (сохранённой) сессии, сохраняя историю.
+    fn switch_model(&mut self, id: &str) {
+        let model = crate::resolve_model_alias(id).to_string();
+        let tab = self.active_mut();
+        let session = tab
+            .save_path
+            .as_ref()
+            .and_then(|path| Session::load_from_path(path).ok());
+        let Some(session) = session else {
+            tab.push(
+                Role::System,
+                "нельзя сменить модель: сессия ещё не сохранена — сделайте ход".to_string(),
+            );
+            return;
+        };
+        tab.handle = worker::spawn_agent(model.clone(), tab.mode, session, tab.save_path.clone());
+        tab.model = model.clone();
+        tab.push(Role::System, format!("модель переключена: {model}"));
     }
 
     fn cancel_turn(&mut self) {
@@ -879,7 +923,7 @@ impl App {
             .first()
             .is_some_and(|line| line.starts_with('/'));
         let title = if typing_command {
-            " /memory · /diff · /config · /theme · /clear · /help · /quit "
+            " /model · /memory · /diff · /config · /theme · /clear · /help · /quit "
         } else {
             " ввод "
         };
@@ -908,7 +952,7 @@ impl App {
             .map_or_else(String::new, |b| format!("  ⎇ {b}"));
         let left = format!(
             " {icon} {label}   ·   {}   ·   {}k↑ {}k↓{branch}",
-            self.model,
+            tab.model,
             tab.in_tok / 1000,
             tab.out_tok / 1000,
         );
@@ -1159,6 +1203,23 @@ fn title_from_session(session: &Session) -> Option<String> {
             _ => None,
         })
     })
+}
+
+/// Строка с настроенными провайдерами из `providers.toml`.
+fn providers_hint() -> String {
+    let config = api::ProvidersConfig::load();
+    let mut parts = Vec::new();
+    if let Some(slot) = config.primary {
+        parts.push(format!("primary={}", slot.model));
+    }
+    if let Some(slot) = config.auxiliary {
+        parts.push(format!("auxiliary={}", slot.model));
+    }
+    if parts.is_empty() {
+        "настроенных провайдеров нет".to_string()
+    } else {
+        format!("настроено: {}", parts.join("  "))
+    }
 }
 
 fn short(text: &str, max: usize) -> String {
