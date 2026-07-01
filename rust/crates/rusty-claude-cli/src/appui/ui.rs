@@ -808,14 +808,19 @@ impl App {
         let theme = self.theme;
         let mut lines = Vec::new();
         for entry in &self.active().entries {
+            if entry.role == Role::Assistant {
+                self.push_markdown(&mut lines, &entry.text, width);
+                lines.push(Line::from(""));
+                continue;
+            }
             let (prefix, color, dim) = match entry.role {
                 Role::User => ("▍ ", theme.accent, false),
-                Role::Assistant => ("", theme.text, false),
                 Role::Thinking => ("· ", theme.muted, true),
                 Role::Tool => ("▹ ", theme.accent2, true),
                 Role::ToolResult => ("", theme.success, true),
                 Role::Error => ("✗ ", theme.error, false),
                 Role::System => ("» ", theme.muted, true),
+                Role::Assistant => unreachable!(),
             };
             let mut style = Style::default().fg(color);
             if dim {
@@ -829,11 +834,39 @@ impl App {
             for wrapped in wrap_text(&body, width) {
                 lines.push(Line::from(Span::styled(wrapped, style)));
             }
-            if matches!(entry.role, Role::User | Role::Assistant) {
+            if entry.role == Role::User {
                 lines.push(Line::from(""));
             }
         }
         lines
+    }
+
+    /// Рендер ответа ассистента с блоками кода ```…``` (моно-панель на всю
+    /// ширину, без переноса), остальной текст — обычным переносом.
+    fn push_markdown(&self, lines: &mut Vec<Line<'static>>, text: &str, width: usize) {
+        let theme = self.theme;
+        let code_style = Style::default()
+            .fg(Color::Rgb(200, 208, 224))
+            .bg(Color::Rgb(30, 33, 44));
+        let mut in_code = false;
+        for raw in text.split('\n') {
+            if raw.trim_start().starts_with("```") {
+                in_code = !in_code;
+                continue;
+            }
+            if in_code {
+                let content: String = raw.chars().take(width.saturating_sub(1)).collect();
+                let padded = format!("{content:<width$}");
+                lines.push(Line::from(Span::styled(padded, code_style)));
+            } else {
+                for wrapped in wrap_text(raw, width) {
+                    lines.push(Line::from(Span::styled(
+                        wrapped,
+                        Style::default().fg(theme.text),
+                    )));
+                }
+            }
+        }
     }
 
     fn draw_input(&mut self, frame: &mut Frame, area: Rect) {
