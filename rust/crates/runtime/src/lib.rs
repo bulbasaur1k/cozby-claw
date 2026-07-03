@@ -10,6 +10,7 @@ mod bootstrap;
 mod compact;
 mod config;
 mod conversation;
+pub mod defaults;
 mod file_ops;
 pub mod green_contract;
 mod hooks;
@@ -50,8 +51,8 @@ pub use compact::{
     get_compact_continuation_message, should_compact, CompactionConfig, CompactionResult,
 };
 pub use config::{
-    ConfigEntry, ConfigError, ConfigLoader, ConfigSource, ExternalConsultConfig,
-    McpConfigCollection,
+    default_config_home, ConfigEntry, ConfigError, ConfigLoader, ConfigSource,
+    ExternalConsultConfig, McpConfigCollection,
     McpManagedProxyServerConfig, McpOAuthConfig, McpRemoteServerConfig, McpSdkServerConfig,
     McpServerConfig, McpStdioServerConfig, McpTransport, McpWebSocketServerConfig, OAuthConfig,
     ResolvedPermissionMode, RuntimeConfig, RuntimeFeatureConfig, RuntimeHookConfig,
@@ -63,6 +64,7 @@ pub use conversation::{
     ConversationRuntime, PromptCacheEvent, RuntimeError, StaticToolExecutor, ToolError,
     ToolExecutor, TurnSummary,
 };
+pub use defaults::{scaffold_config_home, ScaffoldReport};
 pub use file_ops::{
     edit_file, glob_search, grep_search, read_file, write_file, EditFileOutput, GlobSearchOutput,
     GrepSearchInput, GrepSearchOutput, ReadFileOutput, StructuredPatchHunk, TextFilePayload,

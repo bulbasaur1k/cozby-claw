@@ -2045,6 +2045,7 @@ pub struct PluginsCommandResult {
 enum DefinitionSource {
     ProjectCodex,
     ProjectClaude,
+    UserClaw,
     UserCodexHome,
     UserCodex,
     UserClaude,
@@ -2055,6 +2056,7 @@ impl DefinitionSource {
         match self {
             Self::ProjectCodex => "Project (.codex)",
             Self::ProjectClaude => "Project (.claude)",
+            Self::UserClaw => "User (~/.claw)",
             Self::UserCodexHome => "User ($CODEX_HOME)",
             Self::UserCodex => "User (~/.codex)",
             Self::UserClaude => "User (~/.claude)",
@@ -2478,13 +2480,18 @@ fn render_external_status(config: Option<&runtime::ExternalConsultConfig>) -> St
         .audit_log
         .clone()
         .unwrap_or_else(|| ".claw/external-consult-audit.log".to_string());
+    let review = if config.auto_approve {
+        "auto-approve ON — sends WITHOUT manual review (trusted endpoint); secret/PII scan still blocks"
+    } else {
+        "manual review required before every send; secret/PII scan blocks unsafe payloads"
+    };
     format!(
         "external model consultation: enabled\n  \
          model     {}\n  \
          endpoint  {}\n  \
          api key   {key_state}\n  \
          audit log {audit}\n  \
-         Every request is anonymized (namespaces/types) and shown for review before sending.",
+         review    {review}",
         config.model, config.base_url
     )
 }
@@ -2611,6 +2618,18 @@ fn resolve_plugin_target(
     }
 }
 
+/// Домашний каталог конфигурации claw (`$CLAW_CONFIG_HOME` или `~/.claw`).
+///
+/// Это канонический дом для пользовательских скилов/агентов/mcp, наравне с
+/// `providers.toml` и `settings.*`. Возвращает `None`, если ни `CLAW_CONFIG_HOME`,
+/// ни `HOME` не заданы.
+fn claw_config_home() -> Option<PathBuf> {
+    if let Some(explicit) = env::var_os("CLAW_CONFIG_HOME") {
+        return Some(PathBuf::from(explicit));
+    }
+    env::var_os("HOME").map(|home| PathBuf::from(home).join(".claw"))
+}
+
 fn discover_definition_roots(cwd: &Path, leaf: &str) -> Vec<(DefinitionSource, PathBuf)> {
     let mut roots = Vec::new();
 
@@ -2624,6 +2643,15 @@ fn discover_definition_roots(cwd: &Path, leaf: &str) -> Vec<(DefinitionSource, P
             &mut roots,
             DefinitionSource::ProjectClaude,
             ancestor.join(".claude").join(leaf),
+        );
+    }
+
+    // ~/.claw — основной пользовательский источник (перед codex/claude).
+    if let Some(claw_home) = claw_config_home() {
+        push_unique_root(
+            &mut roots,
+            DefinitionSource::UserClaw,
+            claw_home.join(leaf),
         );
     }
 
@@ -2679,6 +2707,16 @@ fn discover_skill_roots(cwd: &Path) -> Vec<SkillRoot> {
             DefinitionSource::ProjectClaude,
             ancestor.join(".claude").join("commands"),
             SkillOrigin::LegacyCommandsDir,
+        );
+    }
+
+    // ~/.claw/skills — основной пользовательский источник (перед codex/claude).
+    if let Some(claw_home) = claw_config_home() {
+        push_unique_skill_root(
+            &mut roots,
+            DefinitionSource::UserClaw,
+            claw_home.join("skills"),
+            SkillOrigin::SkillsDir,
         );
     }
 
@@ -2780,6 +2818,10 @@ fn install_skill_into(
 }
 
 fn default_skill_install_root() -> std::io::Result<PathBuf> {
+    // ~/.claw/skills — канонический дом для пользовательских скилов.
+    if let Some(claw_home) = claw_config_home() {
+        return Ok(claw_home.join("skills"));
+    }
     if let Ok(codex_home) = env::var("CODEX_HOME") {
         return Ok(PathBuf::from(codex_home).join("skills"));
     }
@@ -2788,7 +2830,7 @@ fn default_skill_install_root() -> std::io::Result<PathBuf> {
     }
     Err(std::io::Error::new(
         std::io::ErrorKind::NotFound,
-        "unable to resolve a skills install root; set CODEX_HOME or HOME",
+        "unable to resolve a skills install root; set CLAW_CONFIG_HOME, CODEX_HOME or HOME",
     ))
 }
 
@@ -3157,6 +3199,7 @@ fn render_agents_report(agents: &[AgentSummary]) -> String {
     for source in [
         DefinitionSource::ProjectCodex,
         DefinitionSource::ProjectClaude,
+        DefinitionSource::UserClaw,
         DefinitionSource::UserCodexHome,
         DefinitionSource::UserCodex,
         DefinitionSource::UserClaude,
@@ -3215,6 +3258,7 @@ fn render_skills_report(skills: &[SkillSummary]) -> String {
     for source in [
         DefinitionSource::ProjectCodex,
         DefinitionSource::ProjectClaude,
+        DefinitionSource::UserClaw,
         DefinitionSource::UserCodexHome,
         DefinitionSource::UserCodex,
         DefinitionSource::UserClaude,
@@ -3396,8 +3440,9 @@ fn render_skills_usage(unexpected: Option<&str>) -> String {
         "Skills".to_string(),
         "  Usage            /skills [list|install <path>|help]".to_string(),
         "  Direct CLI       claw skills [list|install <path>|help]".to_string(),
-        "  Install root     $CODEX_HOME/skills or ~/.codex/skills".to_string(),
-        "  Sources          .codex/skills, .claude/skills, legacy /commands".to_string(),
+        "  Install root     ~/.claw/skills (or $CLAW_CONFIG_HOME/skills)".to_string(),
+        "  Sources          ~/.claw/skills, .codex/skills, .claude/skills, legacy /commands"
+            .to_string(),
     ];
     if let Some(args) = unexpected {
         lines.push(format!("  Unexpected       {args}"));
@@ -4455,7 +4500,7 @@ mod tests {
         let skills_help =
             super::handle_skills_slash_command(Some("--help"), &cwd).expect("skills help");
         assert!(skills_help.contains("Usage            /skills [list|install <path>|help]"));
-        assert!(skills_help.contains("Install root     $CODEX_HOME/skills or ~/.codex/skills"));
+        assert!(skills_help.contains("Install root     ~/.claw/skills (or $CLAW_CONFIG_HOME/skills)"));
         assert!(skills_help.contains("legacy /commands"));
 
         let skills_unexpected =

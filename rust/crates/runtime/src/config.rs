@@ -65,6 +65,10 @@ pub struct ExternalConsultConfig {
     pub api_key_env: String,
     /// Optional path for the local audit log of external requests.
     pub audit_log: Option<String>,
+    /// Opt-in: send without the interactive human review (for a trusted internal
+    /// endpoint). Off by default. The secret/PII fail-closed scan ALWAYS runs —
+    /// this only skips the manual y/N confirmation, never the data-protection gate.
+    pub auto_approve: bool,
 }
 
 /// Structured feature configuration consumed by runtime subsystems.
@@ -987,12 +991,14 @@ fn parse_optional_external_consult(
         )
     };
     let audit_log = optional_string(object, "auditLog", context)?.map(str::to_string);
+    let auto_approve = optional_bool(object, "autoApprove", context)?.unwrap_or(false);
     Ok(Some(ExternalConsultConfig {
         enabled,
         model,
         base_url,
         api_key_env,
         audit_log,
+        auto_approve,
     }))
 }
 
@@ -1301,7 +1307,8 @@ mod tests {
                     "model": "gpt-4o",
                     "baseUrl": "https://gw.internal/v1",
                     "apiKeyEnv": "EXT_LLM_KEY",
-                    "auditLog": ".claw/consult-audit.log"
+                    "auditLog": ".claw/consult-audit.log",
+                    "autoApprove": true
                 }
             }"#,
         )
@@ -1314,6 +1321,19 @@ mod tests {
         assert_eq!(parsed.base_url, "https://gw.internal/v1");
         assert_eq!(parsed.api_key_env, "EXT_LLM_KEY");
         assert_eq!(parsed.audit_log.as_deref(), Some(".claw/consult-audit.log"));
+        assert!(parsed.auto_approve);
+    }
+
+    #[test]
+    fn external_consult_auto_approve_defaults_off() {
+        let value = JsonValue::parse(
+            r#"{ "externalConsult": { "enabled": false } }"#,
+        )
+        .unwrap();
+        let parsed = parse_optional_external_consult(&value, "ctx")
+            .unwrap()
+            .unwrap();
+        assert!(!parsed.auto_approve, "autoApprove must default to off");
     }
 
     #[test]

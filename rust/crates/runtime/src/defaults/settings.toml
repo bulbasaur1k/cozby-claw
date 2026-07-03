@@ -1,0 +1,11 @@
+# claw default settings (создано при первом запуске в ~/.claw/settings.toml).
+# Правь свободно — файл больше не перезаписывается.
+
+# Self-repair loop (Tier-1 для слабых моделей).
+# После каждой правки файла запускает локальный check/lint по стеку проекта
+# (cargo check/clippy · tsc/biome · dotnet build · hadolint · shellcheck) и
+# возвращает найденные ошибки модели как контекст — она сама их чинит.
+# Хук НЕ блокирует правку. Полностью офлайн, ничего не уходит наружу.
+# Выключить целиком: CLAW_VERIFY=0.  Только check без clippy/тестов: CLAW_VERIFY_FAST=1.
+[hooks]
+PostToolUse = ['sh "${CLAW_CONFIG_HOME:-$HOME/.claw}/hooks/verify.sh"']

@@ -497,6 +497,23 @@ impl McpServerManager {
         for (server_name, server_config) in servers {
             if server_config.transport() == McpTransport::Stdio {
                 let bootstrap = McpClientBootstrap::from_scoped_config(server_name, server_config);
+                // Skip stdio servers whose launch command is not on PATH. This
+                // lets us ship default servers (Context7 via npx, fetch via uvx,
+                // …) that simply stay dormant when the runtime is missing,
+                // instead of spawning and spamming connection errors.
+                if let McpClientTransport::Stdio(transport) = &bootstrap.transport {
+                    if !command_is_available(&transport.command) {
+                        unsupported_servers.push(UnsupportedMcpServer {
+                            server_name: server_name.clone(),
+                            transport: McpTransport::Stdio,
+                            reason: format!(
+                                "command `{}` not found on PATH; server skipped",
+                                transport.command
+                            ),
+                        });
+                        continue;
+                    }
+                }
                 managed_servers.insert(server_name.clone(), ManagedMcpServer::new(bootstrap));
             } else {
                 unsupported_servers.push(UnsupportedMcpServer {
@@ -1386,6 +1403,45 @@ fn apply_env(command: &mut Command, env: &BTreeMap<String, String>) {
     }
 }
 
+/// Whether a stdio MCP launch command can actually be run.
+///
+/// A command given as an absolute or relative path is checked directly;
+/// a bare name (e.g. `npx`, `uvx`) is resolved against `PATH`. Used to skip
+/// servers whose runtime is not installed instead of spawning and failing.
+fn command_is_available(command: &str) -> bool {
+    if command.is_empty() {
+        return false;
+    }
+    let candidate = std::path::Path::new(command);
+    if candidate.is_absolute() || command.contains(std::path::MAIN_SEPARATOR) {
+        return is_executable_file(candidate);
+    }
+    let Some(paths) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&paths).any(|dir| is_executable_file(&dir.join(command)))
+}
+
+/// True when `path` is an existing regular file with an executable bit set
+/// (on unix); on other platforms, existence as a file is sufficient.
+fn is_executable_file(path: &std::path::Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
 fn encode_frame(payload: &[u8]) -> Vec<u8> {
     let header = format!("Content-Length: {}\r\n\r\n", payload.len());
     let mut framed = header.into_bytes();
@@ -1419,7 +1475,7 @@ mod tests {
 
     use crate::config::{
         ConfigSource, McpRemoteServerConfig, McpSdkServerConfig, McpServerConfig,
-        McpStdioServerConfig, McpWebSocketServerConfig, ScopedMcpServerConfig,
+        McpStdioServerConfig, McpTransport, McpWebSocketServerConfig, ScopedMcpServerConfig,
     };
     use crate::mcp::mcp_tool_name;
     use crate::mcp_client::McpClientBootstrap;
@@ -1774,6 +1830,49 @@ mod tests {
             }),
         };
         McpClientBootstrap::from_scoped_config("stdio server", &config)
+    }
+
+    fn stdio_config(command: &str) -> ScopedMcpServerConfig {
+        ScopedMcpServerConfig {
+            scope: ConfigSource::Local,
+            config: McpServerConfig::Stdio(McpStdioServerConfig {
+                command: command.to_string(),
+                args: Vec::new(),
+                env: BTreeMap::new(),
+                tool_call_timeout_ms: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn stdio_server_with_missing_command_is_skipped_not_managed() {
+        let servers = BTreeMap::from([
+            ("present".to_string(), stdio_config("/bin/sh")),
+            (
+                "absent".to_string(),
+                stdio_config("claw-definitely-not-a-real-binary-xyz"),
+            ),
+        ]);
+
+        let manager = McpServerManager::from_servers(&servers);
+
+        assert_eq!(manager.server_names(), vec!["present".to_string()]);
+        let unsupported = manager.unsupported_servers();
+        assert_eq!(unsupported.len(), 1);
+        assert_eq!(unsupported[0].server_name, "absent");
+        assert_eq!(unsupported[0].transport, McpTransport::Stdio);
+        assert!(unsupported[0].reason.contains("not found on PATH"));
+    }
+
+    #[test]
+    fn command_availability_resolves_paths_and_path_lookup() {
+        assert!(super::command_is_available("/bin/sh"));
+        assert!(super::command_is_available("sh"));
+        assert!(!super::command_is_available(
+            "claw-definitely-not-a-real-binary-xyz"
+        ));
+        assert!(!super::command_is_available("/no/such/binary/really"));
+        assert!(!super::command_is_available(""));
     }
 
     fn script_transport(script_path: &Path) -> crate::mcp_client::McpStdioTransport {

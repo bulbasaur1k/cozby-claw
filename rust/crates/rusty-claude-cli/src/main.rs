@@ -55,7 +55,10 @@ use runtime::{
 };
 use serde::Deserialize;
 use serde_json::json;
-use tools::{external_consult::Anonymizer, GlobalToolRegistry, RuntimeToolDefinition, ToolSearchOutput};
+use tools::{
+    external_consult::Anonymizer, secret_scan, GlobalToolRegistry, RuntimeToolDefinition,
+    ToolSearchOutput,
+};
 
 const DEFAULT_MODEL: &str = "claude-opus-4-6";
 fn max_tokens_for_model(model: &str) -> u32 {
@@ -111,6 +114,9 @@ Run `claw --help` for usage."
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
+    // Seed default skills / mcp.toml / agents dir into ~/.claw on first run.
+    // Best-effort: a scaffolding failure must never block the CLI.
+    ensure_default_config_home();
     match parse_args(&args)? {
         CliAction::DumpManifests => dump_manifests(),
         CliAction::BootstrapPlan => print_bootstrap_plan(),
@@ -153,6 +159,34 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         CliAction::Help => print_help(),
     }
     Ok(())
+}
+
+/// Seed `~/.claw` with default skills, `mcp.toml`, and the reserved `agents/`
+/// directory on first run. Idempotent and best-effort: any error is reported to
+/// stderr but never aborts the CLI.
+fn ensure_default_config_home() {
+    let config_home = runtime::default_config_home();
+    match runtime::scaffold_config_home(&config_home) {
+        Ok(report) if !report.is_empty() => {
+            let mut parts = Vec::new();
+            if !report.created_skills.is_empty() {
+                parts.push(format!("{} skills", report.created_skills.len()));
+            }
+            parts.extend(report.created_files.iter().cloned());
+            eprintln!(
+                "claw: seeded defaults in {} ({})",
+                config_home.display(),
+                parts.join("; ")
+            );
+        }
+        Ok(_) => {}
+        Err(error) => {
+            eprintln!(
+                "claw: could not seed defaults in {}: {error}",
+                config_home.display()
+            );
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6306,6 +6340,8 @@ impl ExternalConsultRuntime {
                 // Ключ задан напрямую в слоте — env-имя не используется.
                 api_key_env: String::new(),
                 audit_log: None,
+                // Слот `[auxiliary]` не задаёт autoApprove — ручное ревью по умолчанию.
+                auto_approve: false,
             },
             api_key: slot.api_key.clone(),
         })
@@ -6332,6 +6368,34 @@ impl ExternalConsultRuntime {
     /// Anonymize → review → send → de-anonymize → audit. Returns the answer
     /// with real identifiers restored, or a declined/error message.
     fn run(&self, question: &str, context: Option<&str>) -> Result<String, ToolError> {
+        // 0. Fail-closed secret/PII gate. For commercial / critical projects the
+        //    single hard rule is that no credential, key, customer data or
+        //    proprietary secret ever leaves the machine. If the payload contains
+        //    any, we refuse outright and tell the model to abstract the problem
+        //    into a generic example — anonymizing identifiers is NOT enough here.
+        let mut scan_target = question.to_string();
+        if let Some(ctx) = context {
+            scan_target.push('\n');
+            scan_target.push_str(ctx);
+        }
+        let findings = secret_scan::scan(&scan_target);
+        if !findings.is_empty() {
+            let summary = secret_scan::summarize(&findings);
+            self.audit(
+                &format!("blocked-secrets [{}]", findings.len()),
+                "<redacted: payload withheld — contained secrets>",
+                findings.len(),
+            );
+            return Ok(format!(
+                "External consultation BLOCKED: the payload contains {n} potential \
+                 secret(s)/PII ({summary}). Nothing was sent. Do NOT paste real \
+                 credentials, tokens, emails or proprietary data to an external model. \
+                 Re-ask as a minimal, self-contained ABSTRACT example that reproduces \
+                 the problem with placeholder names and no real data.",
+                n = findings.len(),
+            ));
+        }
+
         // 1. Anonymize question + context with one shared, reversible mapping.
         let mut anon = Anonymizer::new();
         let safe_question = anon.anonymize(question);
@@ -6341,24 +6405,36 @@ impl ExternalConsultRuntime {
             None => safe_question.clone(),
         };
 
-        // 2. Mandatory review. Without an interactive terminal we cannot show
-        //    the payload to a human, so we refuse to send (fail closed).
-        if !io::stdin().is_terminal() {
-            self.audit("declined-noninteractive", &payload, anon.redactions().len());
-            return Ok(
-                "External consultation skipped: no interactive terminal to review the \
-                 outgoing payload (required before any data leaves for an external model)."
-                    .to_string(),
-            );
-        }
-        if !self.review_and_confirm(&payload, &anon)? {
-            self.audit("declined", &payload, anon.redactions().len());
-            return Ok("External consultation declined by user; nothing was sent.".to_string());
-        }
+        // 2. Review. Skipped only when `autoApprove` is explicitly opted in (a
+        //    trusted internal endpoint). The secret/PII scan above ALWAYS runs —
+        //    autoApprove never bypasses the data-protection gate, only the manual
+        //    y/N confirmation.
+        let sent_decision = if self.config.auto_approve {
+            "sent-auto"
+        } else {
+            // Without an interactive terminal we cannot show the payload to a
+            // human, so we refuse to send (fail closed).
+            if !io::stdin().is_terminal() {
+                self.audit("declined-noninteractive", &payload, anon.redactions().len());
+                return Ok(
+                    "External consultation skipped: no interactive terminal to review the \
+                     outgoing payload (required before any data leaves for an external model). \
+                     Set externalConsult.autoApprove = true only for a trusted endpoint."
+                        .to_string(),
+                );
+            }
+            if !self.review_and_confirm(&payload, &anon)? {
+                self.audit("declined", &payload, anon.redactions().len());
+                return Ok(
+                    "External consultation declined by user; nothing was sent.".to_string()
+                );
+            }
+            "sent"
+        };
 
         // 3. Send the anonymized payload to the external model.
         let answer = self.send(&payload)?;
-        self.audit("sent", &payload, anon.redactions().len());
+        self.audit(sent_decision, &payload, anon.redactions().len());
 
         // 4. Restore the real identifiers in the model's answer.
         Ok(anon.deanonymize(&answer))
@@ -6403,10 +6479,12 @@ impl ExternalConsultRuntime {
             max_tokens: 2048,
             messages: vec![InputMessage::user_text(payload.to_string())],
             system: Some(
-                "You are a senior engineering assistant. Identifiers in the user's code have \
+                "You are a senior engineering assistant. The user asks about a minimal, \
+                 abstract example — not their real codebase. Any remaining identifiers have \
                  been anonymized (types as T_1/T_2…, namespaces as N_1/N_2…) to protect \
-                 proprietary names. Treat them as opaque and reuse the same placeholders \
-                 verbatim in your answer."
+                 proprietary names; treat them as opaque and reuse the same placeholders \
+                 verbatim. Answer the general engineering question with reusable guidance and \
+                 example code; do not ask for the user's real code or data."
                     .to_string(),
             ),
             tools: None,
@@ -6500,21 +6578,27 @@ impl CliToolExecutor {
     }
 
     fn run_external_consult(&self, value: serde_json::Value) -> Result<String, ToolError> {
+        // `example` is the preferred field (an abstract reproduction); `context`
+        // is accepted for backward compatibility. Both are scanned for secrets
+        // and anonymized before anything is sent.
+        #[derive(Deserialize)]
+        struct ConsultRequest {
+            question: String,
+            #[serde(default)]
+            example: Option<String>,
+            #[serde(default)]
+            context: Option<String>,
+        }
         let Some(consult) = &self.external_consult else {
             return Err(ToolError::new(
                 "external model consultation is not enabled; configure `externalConsult` in \
                  settings.json (see /external) and set the API key env var",
             ));
         };
-        #[derive(Deserialize)]
-        struct ConsultRequest {
-            question: String,
-            #[serde(default)]
-            context: Option<String>,
-        }
         let request: ConsultRequest = serde_json::from_value(value)
             .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
-        consult.run(&request.question, request.context.as_deref())
+        let sample = request.example.or(request.context);
+        consult.run(&request.question, sample.as_deref())
     }
 
     fn execute_search_tool(&self, value: serde_json::Value) -> Result<String, ToolError> {
@@ -6874,6 +6958,7 @@ mod tests {
             base_url: "http://x".to_string(),
             api_key_env: "CLAW_TEST_CONSULT_KEY_ABSENT".to_string(),
             audit_log: None,
+            auto_approve: false,
         };
         assert!(ExternalConsultRuntime::from_config(Some(&disabled)).is_none());
 
@@ -6904,6 +6989,7 @@ mod tests {
                 base_url: "http://localhost:1/v1".to_string(),
                 api_key_env: "X".to_string(),
                 audit_log: Some(audit.display().to_string()),
+                auto_approve: false,
             },
             api_key: "dummy".to_string(),
         };

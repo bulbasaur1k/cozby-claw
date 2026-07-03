@@ -406,23 +406,27 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "consult_external_model",
-            description: "Ask a more capable EXTERNAL model for help with a hard problem when \
-                          the internal model is stuck. Only available when external consultation \
-                          is configured. Before anything is sent, identifiers that may carry \
-                          project/company names (namespaces, module paths, type/class names) are \
-                          anonymized and the user must review and approve the exact payload. The \
-                          answer comes back with real names restored. Do NOT include secrets, \
-                          credentials, or customer data — only the minimal code/question needed.",
+            description: "Ask a more capable EXTERNAL model for help when you are stuck — e.g. the \
+                          verify loop keeps failing or you cannot find the cause after a couple of \
+                          tries. Reach for this AUTOMATICALLY at that point (only available when \
+                          external consultation is configured). \
+                          CRITICAL for commercial/critical projects: ask only about a MINIMAL, \
+                          SELF-CONTAINED, ABSTRACT EXAMPLE — a generic reproduction with \
+                          placeholder names. Never paste real project code, business logic, \
+                          customer data, credentials, tokens or emails: the payload is scanned and \
+                          any secret/PII HARD-BLOCKS the send. Remaining identifiers are anonymized \
+                          and the user must review and approve the exact payload before it leaves; \
+                          the answer comes back with real names restored, to apply to your real code.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "question": {
                         "type": "string",
-                        "description": "The specific question for the external model."
+                        "description": "The conceptual/general question, phrased so it does not reveal proprietary details."
                     },
-                    "context": {
+                    "example": {
                         "type": "string",
-                        "description": "Optional minimal code/snippets needed to answer (will be anonymized)."
+                        "description": "A minimal, self-contained ABSTRACT example that reproduces the problem with placeholder names — NOT real project code or data."
                     }
                 },
                 "required": ["question"],
@@ -3011,6 +3015,16 @@ fn resolve_skill_path(skill: &str) -> Result<std::path::PathBuf, String> {
     }
 
     let mut candidates = Vec::new();
+    // Проектный скоуп имеет приоритет над пользовательским.
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd.join(".claw").join("skills"));
+    }
+    // ~/.claw/skills — канонический пользовательский дом (наравне с providers.toml).
+    if let Some(claw_home) = std::env::var_os("CLAW_CONFIG_HOME") {
+        candidates.push(std::path::PathBuf::from(claw_home).join("skills"));
+    } else if let Ok(home) = std::env::var("HOME") {
+        candidates.push(std::path::PathBuf::from(home).join(".claw").join("skills"));
+    }
     if let Ok(codex_home) = std::env::var("CODEX_HOME") {
         candidates.push(std::path::PathBuf::from(codex_home).join("skills"));
     }
@@ -4967,6 +4981,7 @@ fn parse_skill_description(contents: &str) -> Option<String> {
 
 pub mod lane_completion;
 pub mod external_consult;
+pub mod secret_scan;
 
 #[cfg(test)]
 mod tests {
