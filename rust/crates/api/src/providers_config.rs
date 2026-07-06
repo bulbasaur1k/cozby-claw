@@ -9,11 +9,12 @@
 //! лежат прямо в файле для локального удобства, поэтому файл создаётся с правами
 //! `0600` и не должен попадать в репозиторий.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::providers::openai_compat::{OpenAiCompatClient, OpenAiCompatConfig};
+use crate::providers::openai_compat::{AuthSource, OpenAiCompatClient, OpenAiCompatConfig};
 
 /// Протокол провайдера в слоте — какой «диалект» API использовать.
 ///
@@ -46,6 +47,19 @@ fn default_max_tokens() -> u32 {
     8192
 }
 
+/// Тип аутентификации для OpenAI-совместимых провайдеров
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AuthType {
+    /// Bearer токен (Authorization: Bearer <token>)
+    #[default]
+    Bearer,
+    /// API Key (X-API-Key: <key>)
+    ApiKey,
+    /// Кастомные заголовки
+    Custom,
+}
+
 /// Один настроенный провайдер: модель + endpoint + ключ.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderSlot {
@@ -60,16 +74,46 @@ pub struct ProviderSlot {
     pub api_key: String,
     #[serde(default = "default_max_tokens")]
     pub max_tokens: u32,
+    /// Тип аутентификации (bearer | apikey | custom)
+    #[serde(default, rename = "auth_type", alias = "authType")]
+    pub auth_type: AuthType,
+    /// Кастомные заголовки аутентификации (используется при auth_type = custom)
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub custom_headers: BTreeMap<String, String>,
     /// Используется GUI для запоминания режима прав; CLI берёт права из флагов/конфига.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_mode: Option<String>,
 }
 
 impl ProviderSlot {
-    /// Строит OpenAI-совместимый клиент из этого слота (ключ + base URL).
+    /// Строит AuthSource из конфигурации слота
+    fn build_auth_source(&self) -> AuthSource {
+        match &self.auth_type {
+            AuthType::Bearer => {
+                // Определяем тип токена по префиксу
+                if self.api_key.starts_with("ory_at_") {
+                    AuthSource::ApiKey(self.api_key.clone())
+                } else {
+                    AuthSource::Bearer(self.api_key.clone())
+                }
+            }
+            AuthType::ApiKey => AuthSource::ApiKey(self.api_key.clone()),
+            AuthType::Custom => {
+                if self.custom_headers.is_empty() {
+                    // Если кастомные заголовки не указаны, используем Bearer по умолчанию
+                    AuthSource::Bearer(self.api_key.clone())
+                } else {
+                    AuthSource::CustomHeaders(self.custom_headers.clone())
+                }
+            }
+        }
+    }
+
+    /// Строит OpenAI-совместимый клиент из этого слота с правильной аутентификацией.
     #[must_use]
     pub fn openai_client(&self) -> OpenAiCompatClient {
-        OpenAiCompatClient::new(self.api_key.clone(), OpenAiCompatConfig::openai())
+        let auth = self.build_auth_source();
+        OpenAiCompatClient::from_auth(auth, OpenAiCompatConfig::openai())
             .with_base_url(self.base_url.clone())
     }
 }

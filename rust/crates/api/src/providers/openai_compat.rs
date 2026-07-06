@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::time::Duration;
 
+use reqwest::RequestBuilder;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -13,6 +14,103 @@ use crate::types::{
 };
 
 use super::{Provider, ProviderFuture};
+
+/// Источник аутентификации для OpenAI-совместимых провайдеров.
+/// Поддерживает различные схемы: Bearer token, API Key, кастомные заголовки.
+#[derive(Debug, Clone)]
+pub enum AuthSource {
+    /// Стандартный Bearer токен (JWT, OAuth access token)
+    Bearer(String),
+    /// API Key в заголовке X-API-Key (Ory, некоторые провайдеры)
+    ApiKey(String),
+    /// Кастомные заголовки аутентификации
+    CustomHeaders(BTreeMap<String, String>),
+    /// Комбинация: API Key + Bearer (редкие случаи)
+    ApiKeyAndBearer {
+        api_key: String,
+        bearer_token: String,
+    },
+}
+
+impl AuthSource {
+    /// Создаёт AuthSource из env-переменных для xAI
+    pub fn from_env_xai() -> Result<Self, ApiError> {
+        use crate::providers::anthropic::read_env_non_empty;
+        
+        if let Some(token) = read_env_non_empty("AUTH_TOKEN")? {
+            return Ok(Self::Bearer(token));
+        }
+        if let Some(token) = read_env_non_empty("reference_CLI_AUTH_TOKEN")? {
+            return Ok(Self::Bearer(token));
+        }
+        if let Some(api_key) = read_env_non_empty("XAI_API_KEY")? {
+            if api_key.starts_with("ory_at_") {
+                return Ok(Self::ApiKey(api_key));
+            }
+            return Ok(Self::Bearer(api_key));
+        }
+        
+        Err(ApiError::missing_credentials(
+            "xAI",
+            &["XAI_API_KEY", "AUTH_TOKEN"],
+        ))
+    }
+    
+    /// Создаёт AuthSource из env-переменных для OpenAI
+    pub fn from_env_openai() -> Result<Self, ApiError> {
+        use crate::providers::anthropic::read_env_non_empty;
+        
+        if let Some(token) = read_env_non_empty("AUTH_TOKEN")? {
+            return Ok(Self::Bearer(token));
+        }
+        if let Some(token) = read_env_non_empty("reference_CLI_AUTH_TOKEN")? {
+            return Ok(Self::Bearer(token));
+        }
+        if let Some(api_key) = read_env_non_empty("OPENAI_API_KEY")? {
+            if api_key.starts_with("ory_at_") {
+                return Ok(Self::ApiKey(api_key));
+            }
+            return Ok(Self::Bearer(api_key));
+        }
+        
+        Err(ApiError::missing_credentials(
+            "OpenAI",
+            &["OPENAI_API_KEY", "AUTH_TOKEN"],
+        ))
+    }
+
+    /// Применяет заголовки аутентификации к запросу
+    pub fn apply(&self, request_builder: RequestBuilder) -> RequestBuilder {
+        match self {
+            Self::Bearer(token) => request_builder.bearer_auth(token),
+            Self::ApiKey(key) => request_builder.header("X-API-Key", key),
+            Self::CustomHeaders(headers) => {
+                let mut builder = request_builder;
+                for (key, value) in headers {
+                    builder = builder.header(key, value);
+                }
+                builder
+            }
+            Self::ApiKeyAndBearer { api_key, bearer_token } => request_builder
+                .header("X-API-Key", api_key)
+                .bearer_auth(bearer_token),
+        }
+    }
+
+    /// Создаёт кастомные заголовки для custom-auth (как в reference CLI)
+    pub fn custom-auth(jwt: &str) -> Self {
+        let env_token = std::env::var("reference_CLI_AUTH_TOKEN").ok();
+        if env_token.as_deref() == Some(jwt) {
+            // Токен из env — используем стандартный Bearer
+            Self::Bearer(jwt.to_string())
+        } else {
+            // Кэшированный токен — используем кастомный заголовок
+            Self::CustomHeaders(BTreeMap::from([
+                ("Authorization".to_string(), format!("Bearer {}", jwt)),
+            ]))
+        }
+    }
+}
 
 pub const DEFAULT_XAI_BASE_URL: &str = "https://api.x.ai/v1";
 pub const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
@@ -66,7 +164,7 @@ impl OpenAiCompatConfig {
 #[derive(Debug, Clone)]
 pub struct OpenAiCompatClient {
     http: reqwest::Client,
-    api_key: String,
+    auth: AuthSource,
     config: OpenAiCompatConfig,
     base_url: String,
     max_retries: u32,
@@ -78,11 +176,13 @@ impl OpenAiCompatClient {
     const fn config(&self) -> OpenAiCompatConfig {
         self.config
     }
+    
+    /// Создаёт клиента с простым API ключом (Bearer по умолчанию)
     #[must_use]
     pub fn new(api_key: impl Into<String>, config: OpenAiCompatConfig) -> Self {
         Self {
             http: reqwest::Client::new(),
-            api_key: api_key.into(),
+            auth: AuthSource::Bearer(api_key.into()),
             config,
             base_url: read_base_url(config),
             max_retries: DEFAULT_MAX_RETRIES,
@@ -91,14 +191,28 @@ impl OpenAiCompatClient {
         }
     }
 
+    /// Создаёт клиента с явным AuthSource
+    #[must_use]
+    pub fn from_auth(auth: AuthSource, config: OpenAiCompatConfig) -> Self {
+        Self {
+            http: reqwest::Client::new(),
+            auth,
+            config,
+            base_url: read_base_url(config),
+            max_retries: DEFAULT_MAX_RETRIES,
+            initial_backoff: DEFAULT_INITIAL_BACKOFF,
+            max_backoff: DEFAULT_MAX_BACKOFF,
+        }
+    }
+
+    /// Создаёт клиента из env-переменных с автоопределением типа аутентификации
     pub fn from_env(config: OpenAiCompatConfig) -> Result<Self, ApiError> {
-        let Some(api_key) = read_env_non_empty(config.api_key_env)? else {
-            return Err(ApiError::missing_credentials(
-                config.provider_name,
-                config.credential_env_vars(),
-            ));
+        let auth = match config.provider_name {
+            "xAI" => AuthSource::from_env_xai()?,
+            "OpenAI" => AuthSource::from_env_openai()?,
+            _ => AuthSource::from_env_openai()?,
         };
-        Ok(Self::new(api_key, config))
+        Ok(Self::from_auth(auth, config))
     }
 
     #[must_use]
@@ -117,6 +231,12 @@ impl OpenAiCompatClient {
         self.max_retries = max_retries;
         self.initial_backoff = initial_backoff;
         self.max_backoff = max_backoff;
+        self
+    }
+
+    #[must_use]
+    pub fn with_auth_source(mut self, auth: AuthSource) -> Self {
+        self.auth = auth;
         self
     }
 
@@ -191,11 +311,12 @@ impl OpenAiCompatClient {
         request: &MessageRequest,
     ) -> Result<reqwest::Response, ApiError> {
         let request_url = chat_completions_endpoint(&self.base_url);
-        self.http
+        let request_builder = self.http
             .post(&request_url)
             .header("content-type", "application/json")
-            .bearer_auth(&self.api_key)
-            .json(&build_chat_completion_request(request, self.config()))
+            .json(&build_chat_completion_request(request, self.config()));
+        
+        self.auth.apply(request_builder)
             .send()
             .await
             .map_err(ApiError::from)
