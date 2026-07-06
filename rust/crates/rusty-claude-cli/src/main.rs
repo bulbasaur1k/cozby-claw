@@ -147,6 +147,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         CliAction::Login => run_login()?,
         CliAction::Logout => run_logout()?,
         CliAction::Init => run_init()?,
+        CliAction::Update => run_update()?,
         CliAction::BranchDelete => print_branch_delete_report()?,
         CliAction::Repl {
             model,
@@ -249,6 +250,7 @@ enum CliAction {
     Login,
     Logout,
     Init,
+    Update,
     BranchDelete,
     Repl {
         model: String,
@@ -453,6 +455,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         "login" => Ok(CliAction::Login),
         "logout" => Ok(CliAction::Logout),
         "init" => Ok(CliAction::Init),
+        "update" => Ok(CliAction::Update),
         "branch" => parse_branch_args(&rest[1..]),
         "prompt" => {
             let prompt = rest[1..].join(" ");
@@ -4284,6 +4287,56 @@ fn run_init() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Каталог исходников, из которых собран этот бинарь. Путь `CARGO_MANIFEST_DIR`
+/// (`<repo>/rust/crates/rusty-claude-cli`) вшивается на этапе сборки, поэтому
+/// `claw update` работает из любого места, а не только из каталога проекта.
+/// Переопределяется переменной `COZBY_REPO_DIR` (если репо переехал).
+fn source_repo_dir() -> std::path::PathBuf {
+    if let Some(dir) = env::var_os("COZBY_REPO_DIR") {
+        return std::path::PathBuf::from(dir);
+    }
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    manifest
+        .ancestors()
+        .nth(3) // .../rusty-claude-cli → crates → rust → <repo>
+        .map_or_else(|| manifest.to_path_buf(), std::path::Path::to_path_buf)
+}
+
+/// `claw update` — подтягивает свежий код и пересобирает/переустанавливает CLI,
+/// вызывая `release.sh update` в каталоге исходников. Работает из любой
+/// директории. Ставит бинарь туда же, где лежит текущий (`current_exe`), если
+/// `COZBY_BIN_DIR` не задан явно.
+fn run_update() -> Result<(), Box<dyn std::error::Error>> {
+    let repo = source_repo_dir();
+    let script = repo.join("release.sh");
+    if !script.is_file() {
+        return Err(format!(
+            "не найден каталог исходников: {} (нет release.sh).\n\
+             Задай COZBY_REPO_DIR со своим checkout'ом cozby-claw либо запусти \
+             release.sh из него вручную.",
+            repo.display()
+        )
+        .into());
+    }
+
+    println!("==> обновление cozby-claw из {}", repo.display());
+    let mut command = std::process::Command::new("bash");
+    command.arg(&script).arg("update").current_dir(&repo);
+    // По умолчанию ставим туда же, где сейчас установлен бинарь.
+    if env::var_os("COZBY_BIN_DIR").is_none() {
+        if let Some(dir) = env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf))
+        {
+            command.env("COZBY_BIN_DIR", dir);
+        }
+    }
+    let status = command.status()?;
+    if !status.success() {
+        return Err(format!("обновление не удалось (release.sh вышел с {status})").into());
+    }
+    println!("==> готово. Перезапусти claw, чтобы подхватить новую версию.");
+    Ok(())
+}
+
 fn normalize_permission_mode(mode: &str) -> Option<&'static str> {
     match mode.trim() {
         "read-only" => Some("read-only"),
@@ -6925,6 +6978,11 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "  claw login")?;
     writeln!(out, "  claw logout")?;
     writeln!(out, "  claw init")?;
+    writeln!(out, "  claw update")?;
+    writeln!(
+        out,
+        "      Pull latest, rebuild, and reinstall the CLI (works from any directory)"
+    )?;
     writeln!(out, "  claw branch delete")?;
     writeln!(
         out,
@@ -7003,6 +7061,7 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "  claw /skills")?;
     writeln!(out, "  claw login")?;
     writeln!(out, "  claw init")?;
+    writeln!(out, "  claw update")?;
     Ok(())
 }
 
@@ -7464,6 +7523,10 @@ mod tests {
         assert_eq!(
             parse_args(&["init".to_string()]).expect("init should parse"),
             CliAction::Init
+        );
+        assert_eq!(
+            parse_args(&["update".to_string()]).expect("update should parse"),
+            CliAction::Update
         );
         assert_eq!(
             parse_args(&["agents".to_string()]).expect("agents should parse"),
