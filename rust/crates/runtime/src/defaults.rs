@@ -58,6 +58,9 @@ const DEFAULT_MCP_TOML: &str = include_str!("defaults/mcp.toml");
 /// Default `settings.toml` wiring the local self-repair verify hook.
 const DEFAULT_SETTINGS_TOML: &str = include_str!("defaults/settings.toml");
 
+/// Default `plugins.toml` — git plugin sources (ships with the cozby-docs plugin).
+const DEFAULT_PLUGINS_TOML: &str = include_str!("defaults/plugins.toml");
+
 /// The local self-repair verify hook script.
 const DEFAULT_VERIFY_HOOK: &str = include_str!("defaults/hooks/verify.sh");
 
@@ -133,6 +136,14 @@ pub fn scaffold_config_home(config_home: &Path) -> std::io::Result<ScaffoldRepor
         report.created_files.push("mcp.toml".to_string());
     }
 
+    // Default plugin sources (ships the cozby-docs plugin) — only when absent.
+    let plugins_path = config_home.join("plugins.toml");
+    if !plugins_path.exists() {
+        fs::create_dir_all(config_home)?;
+        fs::write(&plugins_path, DEFAULT_PLUGINS_TOML)?;
+        report.created_files.push("plugins.toml".to_string());
+    }
+
     // Reserved home for user agent definitions.
     let agents_dir = config_home.join("agents");
     if !agents_dir.exists() {
@@ -178,9 +189,13 @@ mod tests {
 
         assert_eq!(report.created_skills.len(), DEFAULT_SKILLS.len());
         assert!(report.created("mcp.toml"));
+        assert!(report.created("plugins.toml"));
         assert!(report.created("settings.toml"));
         assert!(report.created("verify hook"));
         assert!(report.created("agents/"));
+        assert!(fs::read_to_string(home.join("plugins.toml"))
+            .expect("read plugins")
+            .contains("cozby-docs"));
         assert!(home.join("skills").join("verify").join("SKILL.md").is_file());
         assert!(home.join("skills").join("grounding").join("SKILL.md").is_file());
         assert!(home.join("skills").join("adr").join("SKILL.md").is_file());
