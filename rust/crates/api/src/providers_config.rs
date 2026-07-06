@@ -11,6 +11,7 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
@@ -58,6 +59,97 @@ pub enum AuthType {
     ApiKey,
     /// Кастомные заголовки
     Custom,
+    /// custom-auth — автоматическое получение JWT через custom-auth login
+    #[serde(rename = "custom-auth")]
+    Command,
+}
+
+/// Конфигурация custom-auth для автоматического получения JWT токена
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommandConfig {
+    /// Путь к dp binary (по умолчанию ~/.reference/dp/dp)
+    #[serde(default)]
+    pub binary_path: Option<String>,
+    /// Команда для получения токена (по умолчанию "auth login")
+    #[serde(default = "default_dp_command")]
+    pub command: String,
+    /// Путь к файлу с кэшем JWT (по умолчанию ~/.reference/custom-auth_creds.json)
+    #[serde(default)]
+    pub cache_path: Option<String>,
+}
+
+fn default_dp_command() -> String {
+    "auth login".to_string()
+}
+
+impl Default for CommandConfig {
+    fn default() -> Self {
+        Self {
+            binary_path: None,
+            command: default_dp_command(),
+            cache_path: None,
+        }
+    }
+}
+
+impl CommandConfig {
+    /// Получает JWT токен из кэша или выполняет команду для его получения
+    pub fn get_jwt_token(&self) -> Result<String, String> {
+        // Пробуем прочитать из кэша
+        let cache_path = self.cache_path.as_deref().unwrap_or("~/.reference/custom-auth_creds.json");
+        let cache_path = expand_tilde(cache_path);
+        
+        if let Ok(content) = std::fs::read_to_string(&cache_path) {
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+                if let Some(jwt) = json.get("jwt").and_then(|v| v.as_str()) {
+                    // Проверяем, не истёк ли токен
+                    if let Some(expires_at) = json.get("expiresAt").and_then(|v| v.as_u64()) {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_millis() as u64;
+                        if expires_at > now {
+                            return Ok(jwt.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Кэша нет или токен истёк — выполняем команду
+        let binary_path = self.binary_path.as_deref().unwrap_or("~/.reference/dp/dp");
+        let binary_path = expand_tilde(binary_path);
+        
+        let output = Command::new(&binary_path)
+            .args(self.command.split_whitespace())
+            .output()
+            .map_err(|e| format!("Failed to execute dp command: {}", e))?;
+        
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("dp command failed: {}", stderr));
+        }
+        
+        // После выполнения команды читаем кэш
+        if let Ok(content) = std::fs::read_to_string(&cache_path) {
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+                if let Some(jwt) = json.get("jwt").and_then(|v| v.as_str()) {
+                    return Ok(jwt.to_string());
+                }
+            }
+        }
+        
+        Err("JWT token not found after custom-auth".to_string())
+    }
+}
+
+fn expand_tilde(path: &str) -> String {
+    if path.starts_with('~') {
+        if let Ok(home) = std::env::var("HOME") {
+            return path.replacen('~', &home, 1);
+        }
+    }
+    path.to_string()
 }
 
 /// Один настроенный провайдер: модель + endpoint + ключ.
@@ -74,9 +166,12 @@ pub struct ProviderSlot {
     pub api_key: String,
     #[serde(default = "default_max_tokens")]
     pub max_tokens: u32,
-    /// Тип аутентификации (bearer | apikey | custom)
+    /// Тип аутентификации (bearer | apikey | custom | custom-auth)
     #[serde(default, rename = "auth_type", alias = "authType")]
     pub auth_type: AuthType,
+    /// Конфигурация custom-auth (используется при auth_type = custom-auth)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom-auth: Option<CommandConfig>,
     /// Кастомные заголовки аутентификации (используется при auth_type = custom)
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub custom_headers: BTreeMap<String, String>,
@@ -87,24 +182,31 @@ pub struct ProviderSlot {
 
 impl ProviderSlot {
     /// Строит AuthSource из конфигурации слота
-    fn build_auth_source(&self) -> AuthSource {
+    fn build_auth_source(&self) -> Result<AuthSource, String> {
         match &self.auth_type {
             AuthType::Bearer => {
                 // Определяем тип токена по префиксу
                 if self.api_key.starts_with("ory_at_") {
-                    AuthSource::ApiKey(self.api_key.clone())
+                    Ok(AuthSource::ApiKey(self.api_key.clone()))
                 } else {
-                    AuthSource::Bearer(self.api_key.clone())
+                    Ok(AuthSource::Bearer(self.api_key.clone()))
                 }
             }
-            AuthType::ApiKey => AuthSource::ApiKey(self.api_key.clone()),
+            AuthType::ApiKey => Ok(AuthSource::ApiKey(self.api_key.clone())),
             AuthType::Custom => {
                 if self.custom_headers.is_empty() {
                     // Если кастомные заголовки не указаны, используем Bearer по умолчанию
-                    AuthSource::Bearer(self.api_key.clone())
+                    Ok(AuthSource::Bearer(self.api_key.clone()))
                 } else {
-                    AuthSource::CustomHeaders(self.custom_headers.clone())
+                    Ok(AuthSource::CustomHeaders(self.custom_headers.clone()))
                 }
+            }
+            AuthType::Command => {
+                // Получаем JWT токен через custom-auth
+                let default_config = CommandConfig::default();
+                let dp_config = self.custom-auth.as_ref().unwrap_or(&default_config);
+                let jwt = dp_config.get_jwt_token()?;
+                Ok(AuthSource::Bearer(jwt))
             }
         }
     }
@@ -112,7 +214,10 @@ impl ProviderSlot {
     /// Строит OpenAI-совместимый клиент из этого слота с правильной аутентификацией.
     #[must_use]
     pub fn openai_client(&self) -> OpenAiCompatClient {
-        let auth = self.build_auth_source();
+        let auth = self.build_auth_source().unwrap_or_else(|e| {
+            eprintln!("Warning: auth error, using fallback: {}", e);
+            AuthSource::Bearer(self.api_key.clone())
+        });
         OpenAiCompatClient::from_auth(auth, OpenAiCompatConfig::openai())
             .with_base_url(self.base_url.clone())
     }
