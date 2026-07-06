@@ -155,6 +155,50 @@ api_key  = "sk-…"
 Env-альтернатива: `OPENAI_API_KEY`/`OPENAI_BASE_URL`,
 `ANTHROPIC_API_KEY`/`ANTHROPIC_BASE_URL`. Подробности и примеры — в **[GUIDE.md](GUIDE.md)** §2.
 
+### Аутентификация (`auth_type`)
+
+Как ключ попадает в запрос — задаётся полем `auth_type` в слоте. Механизм
+**обобщённый**, не завязан на конкретного провайдера:
+
+| `auth_type` | Что делает |
+|---|---|
+| `bearer` (дефолт) | `Authorization: Bearer <api_key>` (или `X-API-Key` для ключей соответствующего формата) |
+| `apikey` | `X-API-Key: <api_key>` |
+| `command` | выполнить `auth_command`, положить вывод в заголовок `auth_header` по шаблону `auth_format` |
+| `custom` | произвольные заголовки из `[slot.custom_headers]` |
+
+**Подстановки** в `api_key` и значениях `custom_headers`:
+
+- `${env:VAR}` — переменная окружения;
+- `${cmd:команда}` — trimmed stdout команды (через системный shell), с TTL-кэшем;
+- `${file:путь}` — содержимое файла (trimmed, `~` раскрывается).
+
+```toml
+# Вариант A — токен из внешней команды/скрипта (частый кейс):
+[primary]
+type = "openai"
+model = "…"
+base_url = "…"
+auth_type   = "command"
+auth_command = "my-auth-cli token"      # любой скрипт; вывод = токен
+auth_header  = "Authorization"          # дефолт
+auth_format  = "Bearer {token}"         # дефолт; {token} = вывод команды
+
+# Вариант B — произвольные заголовки:
+[auxiliary]
+type = "openai"
+model = "…"
+base_url = "…"
+auth_type = "custom"
+[auxiliary.custom_headers]
+X-Auth-Token  = "${cmd:my-auth-cli token}"
+X-Org         = "${env:MY_ORG}"
+X-Extra-Token = "${file:~/.secrets/token}"
+```
+
+Env-тюнинг: `CLAW_AUTH_CMD_TTL_SECS` (кэш вывода `${cmd}`/`command`, дефолт `300`,
+`0` — без кэша), `CLAW_AUTH_DEBUG=1` (подробный лог резолвинга ключей в stderr).
+
 ## externalConsult — консультация у внешней модели (опционально)
 
 Основная (слабая) модель остаётся внутренней; когда она застревает, агент

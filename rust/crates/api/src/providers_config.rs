@@ -9,12 +9,23 @@
 //! лежат прямо в файле для локального удобства, поэтому файл создаётся с правами
 //! `0600` и не должен попадать в репозиторий.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
 use crate::providers::openai_compat::{AuthSource, OpenAiCompatClient, OpenAiCompatConfig};
+
+/// Подробный лог провайдер-конфига/аутентификации. По умолчанию молчит; включить
+/// через `CLAW_AUTH_DEBUG=1` (раньше эти строки печатались всегда и «шумели» в
+/// stderr, попутно раскрывая длины токенов).
+macro_rules! auth_debug {
+    ($($arg:tt)*) => {
+        if std::env::var("CLAW_AUTH_DEBUG").is_ok_and(|value| value != "0" && !value.is_empty()) {
+            eprintln!($($arg)*);
+        }
+    };
+}
 
 /// Протокол провайдера в слоте — какой «диалект» API использовать.
 ///
@@ -56,10 +67,10 @@ pub enum AuthType {
     Bearer,
     /// API Key (X-API-Key: <key>)
     ApiKey,
-    /// Кастомные заголовки
+    /// Кастомные заголовки (значения поддерживают `${env:}`/`${cmd:}`/`${file:}`)
     Custom,
-    /// custom-auth (X-Auth-Token: <jwt>) — для vendor custom-auth
-    #[serde(rename = "customauth")]
+    /// Токен из внешней команды/скрипта (`auth_command`) в произвольный заголовок.
+    /// Напр. `auth_command = "my-auth-cli token"`.
     Command,
 }
 
@@ -72,176 +83,108 @@ fn expand_tilde(path: &str) -> String {
     path.to_string()
 }
 
-/// Раскрывает переменные окружения вида `${env:VAR}` в строке.
-/// Если переменная не задана и это AUTH_TOKEN, пытается получить через `custom-auth token`.
-fn expand_env_vars(s: &str) -> String {
-    let mut result = s.to_string();
-    while let Some(start) = result.find("${env:") {
-        if let Some(end) = result[start..].find('}').map(|i| start + i) {
-            let var_name = &result[start + 6..end];
-            let var_value = get_env_or_custom-auth(var_name);
-            result.replace_range(start..=end, &var_value);
-        } else {
+/// Раскрывает плейсхолдеры в значении конфига (`api_key` и значения
+/// `custom_headers`) — обобщённый, провайдер-агностичный механизм:
+///
+/// * `${env:VAR}` — переменная окружения;
+/// * `${cmd:...}` — trimmed stdout команды (через системный shell), с TTL-кэшем;
+/// * `${file:путь}` — содержимое файла (trimmed, `~` раскрывается).
+///
+/// Нераспознанный плейсхолдер заменяется пустой строкой. Число итераций
+/// ограничено — защита от зацикливания, если подстановка вернёт свой же префикс.
+fn expand_template(input: &str) -> String {
+    let mut result = input.to_string();
+    for _ in 0..256 {
+        let Some(start) = result.find("${") else { break };
+        let Some(end) = result[start..].find('}').map(|offset| start + offset) else {
             break;
-        }
+        };
+        let inner = &result[start + 2..end];
+        let value = match inner.split_once(':') {
+            Some(("env", name)) => std::env::var(name).unwrap_or_default(),
+            Some(("cmd", command)) => run_auth_command(command),
+            Some(("file", path)) => std::fs::read_to_string(expand_tilde(path.trim()))
+                .map(|text| text.trim().to_string())
+                .unwrap_or_default(),
+            _ => {
+                auth_debug!("[DEBUG] Unknown template placeholder: ${{{inner}}}");
+                String::new()
+            }
+        };
+        result.replace_range(start..=end, &value);
     }
     result
 }
 
-/// Получает переменную окружения или выполняет `custom-auth token` для AUTH_TOKEN.
-/// Если есть Ory token, обменивает его на JWT через redacted API.
-fn get_env_or_custom-auth(var_name: &str) -> String {
-    // Сначала пробуем прочитать из env
-    if let Ok(value) = std::env::var(var_name) {
-        if !value.is_empty() {
-            eprintln!("[DEBUG] Using {} from env (len={})", var_name, value.len());
-            return value;
+/// Выполняет команду и возвращает её trimmed stdout как значение (обычно токен).
+/// Исполняется системным shell (`sh -c` / `cmd /C`) — как git `credential.helper`
+/// или aws `credential_process`, поэтому пригодна для произвольных auth-скриптов.
+/// Результат кэшируется на `CLAW_AUTH_CMD_TTL_SECS` секунд (дефолт 300, `0` — без
+/// кэша), чтобы не форкать процесс на каждый билд клиента.
+fn run_auth_command(command: &str) -> String {
+    use std::sync::{Mutex, OnceLock};
+    use std::time::Instant;
+
+    static CACHE: OnceLock<Mutex<HashMap<String, (Instant, String)>>> = OnceLock::new();
+
+    let command = command.trim();
+    if command.is_empty() {
+        return String::new();
+    }
+
+    let ttl = std::env::var("CLAW_AUTH_CMD_TTL_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(300);
+
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+
+    if ttl > 0 {
+        if let Ok(guard) = cache.lock() {
+            if let Some((stored_at, value)) = guard.get(command) {
+                if stored_at.elapsed().as_secs() < ttl {
+                    auth_debug!("[DEBUG] auth cmd cache hit (len={})", value.len());
+                    return value.clone();
+                }
+            }
         }
     }
-    
-    // Если это AUTH_TOKEN или ORY_TOKEN — пробуем получить из кэша
-    if var_name == "AUTH_TOKEN" || var_name == "ORY_TOKEN" {
-        // Пробуем получить JWT из кэша reference (для AUTH_TOKEN)
-        if var_name == "AUTH_TOKEN" {
-            if let Some(jwt) = get_reference_jwt() {
-                eprintln!("[DEBUG] Using JWT from reference cache (len={})", jwt.len());
-                std::env::set_var("AUTH_TOKEN", &jwt);
-                return jwt;
-            }
-            eprintln!("[DEBUG] No reference JWT cache, trying to exchange Ory token...");
-        }
 
-        // Пробуем получить Ory токен из ~/.auth/access_token.json
-        if let Some(ory_token) = get_ory_token() {
-            eprintln!("[DEBUG] Using Ory token from cache (len={})", ory_token.len());
-            
-            // Для AUTH_TOKEN — обмениваем на JWT
-            if var_name == "AUTH_TOKEN" {
-                if let Some(jwt) = exchange_for_jwt(&ory_token) {
-                    eprintln!("[DEBUG] Exchanged Ory token for JWT (len={})", jwt.len());
-                    std::env::set_var("AUTH_TOKEN", &jwt);
-                    return jwt;
-                }
-                eprintln!("[DEBUG] Failed to exchange token, using Ory token");
-            }
-            
-            std::env::set_var(var_name, &ory_token);
-            return ory_token;
-        }
-
-        // Если нет кэша — получаем через auth-cli
-        if let Ok(output) = std::process::Command::new("auth-cli")
-            .args(["auth", "token"])
+    let output = if cfg!(windows) {
+        std::process::Command::new("cmd")
+            .args(["/C", command])
             .output()
-        {
-            if output.status.success() {
-                let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                if !token.is_empty() && !token.contains("unable to load") {
-                    eprintln!("[DEBUG] Got token from auth-cli (len={})", token.len());
-                    
-                    // Для AUTH_TOKEN — обмениваем на JWT
-                    if var_name == "AUTH_TOKEN" {
-                        if let Some(jwt) = exchange_for_jwt(&token) {
-                            eprintln!("[DEBUG] Exchanged Ory token for JWT (len={})", jwt.len());
-                            std::env::set_var("AUTH_TOKEN", &jwt);
-                            return jwt;
-                        }
-                        eprintln!("[DEBUG] Failed to exchange token, using Ory token");
-                    }
-                    
-                    std::env::set_var(var_name, &token);
-                    return token;
-                }
-            }
-        }
-        eprintln!("[DEBUG] Failed to get {}", var_name);
-    }
-
-    String::new()
-}
-
-/// Пытается получить Ory access token из кэша (~/.auth/access_token.json)
-fn get_ory_token() -> Option<String> {
-    use std::path::PathBuf;
-    
-    // Пробуем ~/.auth/access_token.json (основное место хранения auth-cli)
-    let home = std::env::var("HOME").ok()?;
-    let token_path = PathBuf::from(home).join(".auth/access_token.json");
-    
-    eprintln!("[DEBUG] Looking for Ory token at {:?}", token_path);
-    let content = std::fs::read_to_string(&token_path).ok()?;
-    eprintln!("[DEBUG] Read Ory token file (len={})", content.len());
-    
-    let json: serde_json::Value = serde_json::from_str(&content).ok()?;
-    json.get("tokens")
-        .and_then(|v| v.as_array())
-        .and_then(|arr| arr.first())
-        .and_then(|v| v.get("token"))
-        .and_then(|v| v.as_str())
-        .map(String::from)
-}
-
-/// Пытается получить JWT токен из кэша reference (~/.reference/custom-auth_creds.json)
-fn get_reference_jwt() -> Option<String> {
-    use std::path::PathBuf;
-    
-    let home = std::env::var("HOME").ok()?;
-    let creds_path = PathBuf::from(home).join(".reference/custom-auth_creds.json");
-    
-    eprintln!("[DEBUG] Looking for reference creds at {:?}", creds_path);
-    let content = std::fs::read_to_string(&creds_path).ok()?;
-    eprintln!("[DEBUG] Read reference creds (len={})", content.len());
-    
-    let json: serde_json::Value = serde_json::from_str(&content).ok()?;
-    
-    // Проверяем, не истёк ли токен
-    if let Some(expires_at) = json.get("expiresAt").and_then(|v| v.as_u64()) {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()?
-            .as_millis() as u64;
-        if now >= expires_at {
-            eprintln!("[WARN] reference JWT token expired (now={}, expires={})", now, expires_at);
-            return None;
-        }
-    }
-    
-    let jwt = json.get("jwt").and_then(|v| v.as_str()).map(String::from);
-    if let Some(ref t) = jwt {
-        eprintln!("[DEBUG] Found JWT in reference cache (len={})", t.len());
     } else {
-        eprintln!("[DEBUG] No JWT field in reference creds");
+        std::process::Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .output()
+    };
+
+    let value = match output {
+        Ok(out) if out.status.success() => {
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
+        Ok(out) => {
+            auth_debug!(
+                "[DEBUG] auth cmd failed ({}): {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+            String::new()
+        }
+        Err(error) => {
+            auth_debug!("[DEBUG] auth cmd spawn error: {error}");
+            String::new()
+        }
+    };
+
+    if ttl > 0 && !value.is_empty() {
+        if let Ok(mut guard) = cache.lock() {
+            guard.insert(command.to_string(), (Instant::now(), value.clone()));
+        }
     }
-    jwt
-}
-
-/// Обменивает Ory access token на JWT через redacted API
-fn exchange_for_jwt(ory_token: &str) -> Option<String> {
-    use std::time::Duration;
-
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .ok()?;
-
-    let response = client
-        .post("https://internal-host.example/api/v2/token")
-        .header("Authorization", format!("Bearer {}", ory_token))
-        .send()
-        .ok()?;
-
-    if !response.status().is_success() {
-        eprintln!("[WARN] Failed to exchange token: {}", response.status());
-        return None;
-    }
-
-    let json: serde_json::Value = response.json().ok()?;
-    // Возвращаем JWT из поля "jwt" (а не "token")
-    let jwt = json.get("jwt").and_then(|v| v.as_str()).map(String::from);
-    if let Some(ref t) = jwt {
-        eprintln!("[DEBUG] Exchanged token, got JWT (len={})", t.len());
-    }
-    jwt
+    value
 }
 
 /// Один настроенный провайдер: модель + endpoint + ключ.
@@ -261,9 +204,20 @@ pub struct ProviderSlot {
     /// Тип аутентификации (bearer | apikey | custom)
     #[serde(default, rename = "auth_type", alias = "authType")]
     pub auth_type: AuthType,
-    /// Кастомные заголовки аутентификации (используется при auth_type = custom)
+    /// Кастомные заголовки аутентификации (используется при `auth_type = "custom"`).
+    /// Значения раскрывают `${env:VAR}` / `${cmd:...}` / `${file:путь}`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub custom_headers: BTreeMap<String, String>,
+    /// Команда/скрипт для получения токена (при `auth_type = "command"`).
+    /// Исполняется системным shell; trimmed stdout идёт в заголовок `auth_header`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_command: Option<String>,
+    /// Заголовок для токена из `auth_command` (дефолт `Authorization`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_header: Option<String>,
+    /// Шаблон значения заголовка; `{token}` → вывод команды (дефолт `Bearer {token}`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_format: Option<String>,
     /// Используется GUI для запоминания режима прав; CLI берёт права из флагов/конфига.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_mode: Option<String>,
@@ -272,46 +226,69 @@ pub struct ProviderSlot {
 impl ProviderSlot {
     /// Строит AuthSource из конфигурации слота
     fn build_auth_source(&self) -> Result<AuthSource, String> {
-        // Раскрываем переменные окружения в api_key
-        let api_key = expand_env_vars(&self.api_key);
-        eprintln!("[DEBUG] build_auth_source: api_key len={}, starts with: {}", api_key.len(), &api_key[..api_key.len().min(30)]);
+        // Раскрываем ${env:}/${cmd:}/${file:} в api_key
+        let api_key = expand_template(&self.api_key);
+        auth_debug!(
+            "[DEBUG] build_auth_source: auth_type={:?}, api_key len={}",
+            self.auth_type,
+            api_key.len()
+        );
 
         match &self.auth_type {
             AuthType::Bearer => {
                 // Определяем тип токена по префиксу
                 if api_key.starts_with("ory_at_") {
-                    eprintln!("[DEBUG] Using ApiKey auth (ory token)");
+                    auth_debug!("[DEBUG] Using ApiKey auth (ory token)");
                     Ok(AuthSource::ApiKey(api_key))
                 } else {
-                    eprintln!("[DEBUG] Using Bearer auth (JWT)");
+                    auth_debug!("[DEBUG] Using Bearer auth (JWT)");
                     Ok(AuthSource::Bearer(api_key))
                 }
             }
             AuthType::ApiKey => {
-                eprintln!("[DEBUG] Using ApiKey auth");
+                auth_debug!("[DEBUG] Using ApiKey auth");
                 Ok(AuthSource::ApiKey(api_key))
             }
             AuthType::Custom => {
                 if self.custom_headers.is_empty() {
-                    eprintln!("[DEBUG] Using Bearer auth (custom empty)");
+                    auth_debug!("[DEBUG] Using Bearer auth (custom empty)");
                     Ok(AuthSource::Bearer(api_key))
                 } else {
-                    // Раскрываем переменные окружения в заголовках
-                    let headers: BTreeMap<String, String> = self.custom_headers
-                        .iter()
-                        .map(|(k, v)| (k.clone(), expand_env_vars(v)))
-                        .collect();
-                    eprintln!("[DEBUG] Using CustomHeaders auth: {:?}", headers.keys().collect::<Vec<_>>());
+                    let headers = self.expanded_custom_headers();
+                    auth_debug!(
+                        "[DEBUG] Using CustomHeaders auth: {:?}",
+                        headers.keys().collect::<Vec<_>>()
+                    );
                     Ok(AuthSource::CustomHeaders(headers))
                 }
             }
             AuthType::Command => {
-                // Для custom-auth используем X-Auth-Token заголовок
-                // api_key содержит JWT токен (полученный автоматически или из env)
-                eprintln!("[DEBUG] Using CommandToken auth (custom-auth)");
-                Ok(AuthSource::CommandToken(api_key))
+                // Токен из внешней команды → произвольный заголовок, плюс любые
+                // дополнительные custom_headers. Провайдер-агностично.
+                let mut headers = self.expanded_custom_headers();
+                if let Some(command) = self.auth_command.as_deref() {
+                    let token = run_auth_command(command);
+                    if token.is_empty() {
+                        auth_debug!("[DEBUG] auth_command produced empty token");
+                    } else {
+                        let header = self.auth_header.as_deref().unwrap_or("Authorization");
+                        let format = self.auth_format.as_deref().unwrap_or("Bearer {token}");
+                        headers.insert(header.to_string(), format.replace("{token}", &token));
+                    }
+                } else {
+                    auth_debug!("[DEBUG] auth_type=command but auth_command is unset");
+                }
+                Ok(AuthSource::CustomHeaders(headers))
             }
         }
+    }
+
+    /// Раскрывает шаблоны в значениях `custom_headers`.
+    fn expanded_custom_headers(&self) -> BTreeMap<String, String> {
+        self.custom_headers
+            .iter()
+            .map(|(key, value)| (key.clone(), expand_template(value)))
+            .collect()
     }
 
     /// Строит OpenAI-совместимый клиент из этого слота с правильной аутентификацией.
@@ -354,7 +331,7 @@ impl ProvidersConfig {
     #[must_use]
     pub fn config_path() -> PathBuf {
         let path = config_home().join("providers.toml");
-        eprintln!("[DEBUG] ProvidersConfig path: {:?}", path);
+        auth_debug!("[DEBUG] ProvidersConfig path: {:?}", path);
         path
     }
 
@@ -363,14 +340,14 @@ impl ProvidersConfig {
     #[must_use]
     pub fn load() -> Self {
         let Ok(text) = std::fs::read_to_string(Self::config_path()) else {
-            eprintln!("[DEBUG] Failed to read providers.toml");
+            auth_debug!("[DEBUG] Failed to read providers.toml");
             return Self::default();
         };
-        eprintln!("[DEBUG] providers.toml content ({} bytes)", text.len());
+        auth_debug!("[DEBUG] providers.toml content ({} bytes)", text.len());
         match toml::from_str(&text) {
             Ok(config) => config,
             Err(e) => {
-                eprintln!("[DEBUG] Failed to parse providers.toml: {}", e);
+                auth_debug!("[DEBUG] Failed to parse providers.toml: {}", e);
                 Self::default()
             }
         }
@@ -404,7 +381,8 @@ impl ProvidersConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{ProviderSlotKind, ProvidersConfig};
+    use super::{expand_template, ProviderSlotKind, ProvidersConfig};
+    use crate::providers::openai_compat::AuthSource;
 
     #[test]
     fn parses_primary_and_auxiliary_slots() {
@@ -496,5 +474,100 @@ mod tests {
         let serialized = toml::to_string_pretty(&config).expect("serializes");
         let reparsed: ProvidersConfig = toml::from_str(&serialized).expect("reparses");
         assert_eq!(reparsed.primary.expect("primary").model, "m");
+    }
+
+    #[test]
+    fn expand_template_resolves_env_cmd_and_file() {
+        // ${env:} — из окружения.
+        std::env::set_var("CLAW_TPL_TEST", "sekret");
+        assert_eq!(expand_template("v=${env:CLAW_TPL_TEST}"), "v=sekret");
+        std::env::remove_var("CLAW_TPL_TEST");
+
+        // ${cmd:} — trimmed stdout (уникальная команда, чтобы не ловить кэш).
+        assert_eq!(expand_template("t=${cmd:printf claw-tpl-9f}"), "t=claw-tpl-9f");
+
+        // ${file:} — содержимое файла, trimmed.
+        let file = std::env::temp_dir().join(format!("claw-tpl-{}.txt", std::process::id()));
+        std::fs::write(&file, "filetoken\n").expect("write temp file");
+        assert_eq!(
+            expand_template(&format!("f=${{file:{}}}", file.display())),
+            "f=filetoken"
+        );
+        let _ = std::fs::remove_file(&file);
+
+        // Нераспознанный плейсхолдер → пустая строка.
+        assert_eq!(expand_template("a${bogus:x}b"), "ab");
+    }
+
+    #[test]
+    fn command_auth_type_injects_token_into_header() {
+        let toml = r#"
+            [primary]
+            type = "openai"
+            model = "m"
+            base_url = "u"
+            auth_type = "command"
+            auth_command = "printf tok-123"
+        "#;
+        let slot = toml::from_str::<ProvidersConfig>(toml)
+            .expect("parses")
+            .primary
+            .expect("primary");
+        match slot.build_auth_source().expect("auth") {
+            AuthSource::CustomHeaders(headers) => assert_eq!(
+                headers.get("Authorization").map(String::as_str),
+                Some("Bearer tok-123"),
+                "default header/format is `Authorization: Bearer {{token}}`"
+            ),
+            other => panic!("expected CustomHeaders, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn command_auth_type_honours_custom_header_and_format() {
+        let toml = r#"
+            [primary]
+            type = "openai"
+            model = "m"
+            auth_type = "command"
+            auth_command = "printf abc"
+            auth_header = "X-Token"
+            auth_format = "{token}"
+        "#;
+        let slot = toml::from_str::<ProvidersConfig>(toml)
+            .expect("parses")
+            .primary
+            .expect("primary");
+        match slot.build_auth_source().expect("auth") {
+            AuthSource::CustomHeaders(headers) => {
+                assert_eq!(headers.get("X-Token").map(String::as_str), Some("abc"));
+            }
+            other => panic!("expected CustomHeaders, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn custom_headers_expand_command_placeholders() {
+        // Произвольный заголовок с токеном из команды через ${cmd:}.
+        let toml = r#"
+            [primary]
+            type = "openai"
+            model = "m"
+            auth_type = "custom"
+
+            [primary.custom_headers]
+            X-Auth-Token = "${cmd:printf jwt-xyz}"
+        "#;
+        let slot = toml::from_str::<ProvidersConfig>(toml)
+            .expect("parses")
+            .primary
+            .expect("primary");
+        match slot.build_auth_source().expect("auth") {
+            AuthSource::CustomHeaders(headers) => assert_eq!(
+                headers.get("X-Auth-Token").map(String::as_str),
+                Some("jwt-xyz")
+            ),
+            other => panic!("expected CustomHeaders, got {other:?}"),
+        }
     }
 }

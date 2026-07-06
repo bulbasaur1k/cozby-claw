@@ -96,6 +96,38 @@ api_key  = "ollama"            # многие локальные серверы 
 > Старый ключ `kind` (вместо `type`) всё ещё принимается для совместимости с
 > файлами от прежних версий.
 
+### Кастомная аутентификация (команды / скрипты / заголовки)
+
+Если провайдер требует не просто `Bearer <key>`, а токен из внешней команды или
+нестандартные заголовки — задайте `auth_type`. Механизм общий, ни к одному
+провайдеру не привязан.
+
+```toml
+# Токен из скрипта (подойдёт любой внешний auth-CLI):
+[primary]
+type = "openai"
+model = "…"
+base_url = "…"
+auth_type    = "command"
+auth_command = "my-auth-cli token"      # вывод команды = токен
+auth_header  = "Authorization"          # дефолт
+auth_format  = "Bearer {token}"         # дефолт; {token} → вывод команды
+
+# Произвольные заголовки с подстановкой ${env:} / ${cmd:} / ${file:}:
+[auxiliary]
+type = "openai"
+model = "…"
+base_url = "…"
+auth_type = "custom"
+[auxiliary.custom_headers]
+X-Auth-Token = "${cmd:my-auth-cli token}"
+X-Org        = "${env:MY_ORG}"
+```
+
+Вывод `${cmd:…}` кэшируется на `CLAW_AUTH_CMD_TTL_SECS` секунд (дефолт 300).
+Полная таблица `auth_type` и подстановок — в **[CONFIG.md](CONFIG.md)** →
+«Аутентификация».
+
 Альтернатива — переменные окружения:
 
 | Провайдер | Переменные |

@@ -42,6 +42,43 @@ export ANTHROPIC_API_KEY="ваш-ключ"
 ./target/debug/claw prompt "привет"
 ```
 
+### Кастомная аутентификация
+
+Если провайдер требует не просто `Bearer <key>`, а токен из внешней команды/скрипта
+или нестандартные заголовки — задайте это в `~/.claw/providers.toml` (файл вне git,
+права 600). Механизм провайдер-агностичный.
+
+Токен из внешнего auth-CLI:
+
+```toml
+[primary]
+type = "openai"
+model = "local-model"
+base_url = "http://127.0.0.1:8080/v1"
+auth_type    = "command"
+auth_command = "my-auth-cli token"   # любой скрипт; его stdout = токен
+auth_header  = "Authorization"        # дефолт
+auth_format  = "Bearer {token}"       # дефолт; {token} → вывод команды
+```
+
+Произвольные заголовки с подстановкой `${env:VAR}` / `${cmd:…}` / `${file:путь}`:
+
+```toml
+[primary]
+type = "openai"
+model = "local-model"
+base_url = "http://127.0.0.1:8080/v1"
+auth_type = "custom"
+
+[primary.custom_headers]
+X-Auth-Token = "${cmd:my-auth-cli token}"
+X-Org        = "${env:MY_ORG}"
+X-Extra      = "${file:~/.secrets/token}"
+```
+
+Вывод `${cmd:…}` кэшируется на `CLAW_AUTH_CMD_TTL_SECS` секунд (дефолт 300).
+Полная таблица `auth_type` и примеры — в [CONFIG.md](CONFIG.md) → «Аутентификация».
+
 ## MCP (Model Context Protocol)
 
 `cozby-claw` одновременно является **MCP-клиентом** (подключается к внешним MCP-серверам и получает от них инструменты) и поставляется с **бинарным MCP-сервером** (отдаёт ограниченный безопасный набор локальных инструментов любому MCP-совместимому LLM).

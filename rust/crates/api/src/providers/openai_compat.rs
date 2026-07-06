@@ -30,8 +30,6 @@ pub enum AuthSource {
         api_key: String,
         bearer_token: String,
     },
-    /// X-Auth-Token заголовок (для custom-auth в vendor)
-    CommandToken(String),
 }
 
 impl AuthSource {
@@ -84,7 +82,6 @@ impl AuthSource {
             Self::ApiKeyAndBearer { api_key, bearer_token } => request_builder
                 .header("X-API-Key", api_key)
                 .bearer_auth(bearer_token),
-            Self::CommandToken(token) => request_builder.header("X-Auth-Token", token),
         }
     }
 }
