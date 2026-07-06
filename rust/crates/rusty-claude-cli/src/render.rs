@@ -366,11 +366,18 @@ impl TerminalRenderer {
                     } else {
                         link.text
                     };
-                    let rendered = format!(
+                    let visible = format!(
                         "{}",
                         format!("[{label}]({})", link.destination)
                             .underlined()
                             .with(self.color_theme.link)
+                    );
+                    // OSC 8 — делает текст кликабельным в поддерживающих терминалах
+                    // (iTerm2, WezTerm, kitty, GNOME Terminal, …); в остальных
+                    // последовательность игнорируется и виден обычный текст.
+                    let rendered = format!(
+                        "\u{1b}]8;;{}\u{1b}\\{visible}\u{1b}]8;;\u{1b}\\",
+                        link.destination
                     );
                     state.append_raw(output, &rendered);
                 }
@@ -715,6 +722,17 @@ mod tests {
 
         assert!(plain_text.contains("[Claw](https://example.com/docs)"));
         assert!(markdown_output.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn renders_links_as_osc8_hyperlinks() {
+        let terminal_renderer = TerminalRenderer::new();
+        let out =
+            terminal_renderer.render_markdown("See [Claw](https://example.com/docs) now.");
+        // OSC 8 открывается адресом назначения и закрывается пустым — так сам
+        // ярлык становится кликабельным в поддерживающих терминалах.
+        assert!(out.contains("\u{1b}]8;;https://example.com/docs\u{1b}\\"));
+        assert!(out.contains("\u{1b}]8;;\u{1b}\\"));
     }
 
     #[test]

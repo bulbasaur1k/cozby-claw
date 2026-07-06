@@ -1389,6 +1389,10 @@ impl App {
         let mut in_code = false;
         let mut code_lang = String::new();
         let mut code_buf = String::new();
+        // Текущая ссылка: URL и накопленный видимый текст (для сравнения, чтобы не
+        // печатать `url (url)` для «голых» автоссылок).
+        let mut link_url: Option<String> = None;
+        let mut link_text = String::new();
         for event in Parser::new_ext(text, Options::all()) {
             match event {
                 MdEvent::Start(Tag::CodeBlock(kind)) => {
@@ -1406,14 +1410,34 @@ impl App {
                     lines.push(Line::from(""));
                 }
                 MdEvent::Text(t) if in_code => code_buf.push_str(&t),
-                MdEvent::Text(t) => md.text(lines, &t),
+                MdEvent::Text(t) => {
+                    if link_url.is_some() {
+                        link_text.push_str(&t);
+                    }
+                    md.text(lines, &t);
+                }
                 MdEvent::Code(c) => md.inline_code(lines, &c),
                 MdEvent::Start(Tag::Strong) => md.strong += 1,
                 MdEvent::End(TagEnd::Strong) => md.strong = md.strong.saturating_sub(1),
                 MdEvent::Start(Tag::Emphasis) => md.emphasis += 1,
                 MdEvent::End(TagEnd::Emphasis) => md.emphasis = md.emphasis.saturating_sub(1),
-                MdEvent::Start(Tag::Link { .. }) => md.link += 1,
-                MdEvent::End(TagEnd::Link) => md.link = md.link.saturating_sub(1),
+                MdEvent::Start(Tag::Link { dest_url, .. }) => {
+                    md.link += 1;
+                    link_url = Some(dest_url.to_string());
+                    link_text.clear();
+                }
+                MdEvent::End(TagEnd::Link) => {
+                    // ratatui не умеет OSC 8, поэтому печатаем сам URL рядом с
+                    // текстом — его видно и можно открыть Cmd/Ctrl+кликом в
+                    // терминалах с автолинковкой. md.link ещё > 0 → URL идёт
+                    // тем же link-стилем.
+                    if let Some(url) = link_url.take() {
+                        if !url.is_empty() && link_text.trim() != url.trim() {
+                            md.text(lines, &format!(" ({url})"));
+                        }
+                    }
+                    md.link = md.link.saturating_sub(1);
+                }
                 MdEvent::Start(Tag::Heading { level, .. }) => {
                     md.flush(lines);
                     md.heading = heading_rank(level);
