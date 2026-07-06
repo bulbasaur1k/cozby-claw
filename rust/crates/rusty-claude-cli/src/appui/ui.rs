@@ -11,8 +11,8 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant, SystemTime};
 
 use crossterm::event::{
-    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
 };
 use crossterm::execute;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -300,10 +300,12 @@ enum Focus {
 /// Ошибки терминала/ввода-вывода.
 pub fn run(model: String, mode: PermissionMode) -> Result<(), Box<dyn std::error::Error>> {
     let mut terminal = ratatui::init();
-    let _ = execute!(std::io::stdout(), EnableBracketedPaste);
+    // Mouse capture — чтобы ловить прокрутку колесом/тачпадом. Побочный эффект:
+    // нативное выделение мышью в терминале требует Shift (стандартно для TUI).
+    let _ = execute!(std::io::stdout(), EnableBracketedPaste, EnableMouseCapture);
     let mut app = App::new(model, mode);
     let result = app.event_loop(&mut terminal);
-    let _ = execute!(std::io::stdout(), DisableBracketedPaste);
+    let _ = execute!(std::io::stdout(), DisableBracketedPaste, DisableMouseCapture);
     ratatui::restore();
     result
 }
@@ -388,6 +390,12 @@ impl App {
                         self.input.insert_str(&text);
                         self.recompute_completion();
                     }
+                    Event::Mouse(mouse) => match mouse.kind {
+                        MouseEventKind::ScrollUp => self.scroll_history(3),
+                        MouseEventKind::ScrollDown => self.scroll_history(-3),
+                        // move/drag/click событий много — не перерисовываемся зря
+                        _ => continue,
+                    },
                     Event::Resize(_, _) => {}
                     _ => continue,
                 }
@@ -433,6 +441,18 @@ impl App {
             }
         }
         changed
+    }
+
+    /// Прокручивает историю активной вкладки: положительный `delta` — вверх
+    /// (в прошлое), отрицательный — вниз (к свежим сообщениям). Ограничение по
+    /// краям делает [`Self::draw_history`].
+    fn scroll_history(&mut self, delta: i16) {
+        let s = &mut self.active_mut().scroll_back;
+        *s = if delta >= 0 {
+            s.saturating_add(delta.unsigned_abs())
+        } else {
+            s.saturating_sub(delta.unsigned_abs())
+        };
     }
 
     // --- клавиши ------------------------------------------------------------
@@ -509,14 +529,10 @@ impl App {
                     self.reset_input();
                 }
             }
-            KeyCode::PageUp => {
-                let s = &mut self.active_mut().scroll_back;
-                *s = s.saturating_add(8);
-            }
-            KeyCode::PageDown => {
-                let s = &mut self.active_mut().scroll_back;
-                *s = s.saturating_sub(8);
-            }
+            KeyCode::Up if shift => self.scroll_history(3),
+            KeyCode::Down if shift => self.scroll_history(-3),
+            KeyCode::PageUp => self.scroll_history(8),
+            KeyCode::PageDown => self.scroll_history(-8),
             KeyCode::Enter if alt || shift => self.input.insert_newline(),
             KeyCode::Enter => self.submit(),
             _ => {

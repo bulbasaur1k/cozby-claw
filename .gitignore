@@ -8,3 +8,10 @@ archive/
 # Local session transcripts and OS junk
 .claw/
 .DS_Store
+
+# Real local configs — copy from *.example.* and keep keys out of git.
+# Anchored to repo root so tracked defaults under rust/.../src/defaults/ stay in.
+/providers.toml
+/mcp.toml
+/settings.json
+/settings.toml

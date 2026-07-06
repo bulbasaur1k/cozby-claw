@@ -1,0 +1,73 @@
+# ── cozby-claw: пример конфига провайдеров ───────────────────────────────────
+#
+# Скопируй в БОЕВОЙ файл (в git не попадёт) и впиши свои ключи/модель:
+#
+#   cp providers.example.toml ~/.claw/providers.toml
+#   # либо для локальной разработки прямо из репо:
+#   export CLAW_CONFIG_HOME="$PWD/.claw" && cp providers.example.toml .claw/providers.toml
+#
+# Реальный providers.toml НЕ коммить (ключи!). Файл создаётся с правами 0600.
+# Полная документация: CONFIG.md → «providers.toml» и «Аутентификация».
+# ─────────────────────────────────────────────────────────────────────────────
+
+# primary — основная модель, которой думает агент.
+[primary]
+type       = "openai"        # "openai" (любой OpenAI-совместимый) | "anthropic"
+model      = "qwen/qwen3-coder"
+base_url   = "https://openrouter.ai/api/v1"
+api_key    = "sk-or-…"        # можно "${env:OPENAI_API_KEY}" — см. подстановки ниже
+max_tokens = 8192
+
+# auxiliary — опц. «более сильная» модель для инструмента consult_external_model.
+[auxiliary]
+type     = "openai"
+model    = "deepseek-chat"
+base_url = "https://api.deepseek.com/v1"
+api_key  = "${env:DEEPSEEK_API_KEY}"
+
+# ── Примеры разных провайдеров (раскомментируй нужное вместо [primary]) ───────
+
+# Нативный Anthropic — ключ из файла или OAuth/ANTHROPIC_API_KEY из env.
+# [primary]
+# type    = "anthropic"
+# model   = "claude-opus-4-8"
+# api_key = ""                 # пусто → OAuth / ANTHROPIC_API_KEY
+
+# Локальный сервер (Ollama / LM Studio / llama.cpp) — офлайн, ключ обычно игнорится.
+# [primary]
+# type     = "openai"
+# model    = "qwen2.5-coder"
+# base_url = "http://localhost:11434/v1"
+# api_key  = "local"
+
+# ── Аутентификация (auth_type) ───────────────────────────────────────────────
+# bearer (дефолт) → Authorization: Bearer <api_key>
+# apikey          → X-API-Key: <api_key>
+# command         → токен из внешней команды/скрипта в заголовок
+# custom          → произвольные заголовки из [slot.custom_headers]
+#
+# В api_key и значениях custom_headers работают подстановки:
+#   ${env:VAR}     — переменная окружения
+#   ${cmd:команда} — trimmed stdout команды (через shell), кэш CLAW_AUTH_CMD_TTL_SECS
+#   ${file:путь}   — содержимое файла (~ раскрывается)
+
+# Токен из внешнего auth-CLI:
+# [primary]
+# type         = "openai"
+# model        = "…"
+# base_url     = "…"
+# auth_type    = "command"
+# auth_command = "my-auth-cli token"   # любой скрипт; его stdout = токен
+# auth_header  = "Authorization"        # дефолт
+# auth_format  = "Bearer {token}"       # дефолт; {token} → вывод команды
+
+# Произвольные заголовки:
+# [primary]
+# type      = "openai"
+# model     = "…"
+# base_url  = "…"
+# auth_type = "custom"
+# [primary.custom_headers]
+# X-Auth-Token = "${cmd:my-auth-cli token}"
+# X-Org        = "${env:MY_ORG}"
+# X-Extra      = "${file:~/.secrets/token}"
