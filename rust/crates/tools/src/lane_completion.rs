@@ -112,6 +112,8 @@ mod tests {
             lane_events: vec![],
             current_blocker: None,
             error: None,
+            pid: None,
+            result: None,
         }
     }
     

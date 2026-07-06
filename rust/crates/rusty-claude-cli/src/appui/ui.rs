@@ -372,6 +372,9 @@ impl App {
             if self.drain_worker() {
                 dirty = true;
             }
+            if self.drain_agent_notices() {
+                dirty = true;
+            }
             let busy = self.tabs.iter().any(|tab| tab.running);
             let timeout = if busy {
                 Duration::from_millis(120)
@@ -395,6 +398,25 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    /// Показывает завершившиеся фоновые под-агенты (`Agent` tool) системными
+    /// строками активной вкладки. Возвращает `true`, если что-то добавлено.
+    fn drain_agent_notices(&mut self) -> bool {
+        let notices = tools::drain_agent_notifications();
+        if notices.is_empty() {
+            return false;
+        }
+        for notice in notices {
+            self.active_mut().push(
+                Role::System,
+                format!(
+                    "agent {} ({}) → {}",
+                    notice.name, notice.agent_id, notice.status
+                ),
+            );
+        }
+        true
     }
 
     /// Дренирует воркеры ВСЕХ вкладок (фоновые продолжают идти). Возвращает

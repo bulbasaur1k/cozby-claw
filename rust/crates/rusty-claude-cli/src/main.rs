@@ -162,6 +162,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// При старте помечает «осиротевшие» фоновые под-агенты — running-манифесты,
+/// чей процесс уже не жив (потоки не переживают перезапуск) — как `interrupted`,
+/// чтобы они не зависали в `running` навсегда. Best-effort: только stderr.
+fn reconcile_orphaned_agents_best_effort() {
+    match tools::reconcile_orphaned_agents() {
+        Ok(0) => {}
+        Ok(count) => eprintln!("reconciled {count} orphaned sub-agent(s) → interrupted"),
+        Err(error) => eprintln!("agent reconcile skipped: {error}"),
+    }
+}
+
 /// Seed `~/.claw` with default skills, `mcp.toml`, and the reserved `agents/`
 /// directory on first run. Idempotent and best-effort: any error is reported to
 /// stderr but never aborts the CLI.
@@ -1847,6 +1858,7 @@ fn run_repl(
     // invocations so scripted runs stay side-effect free.
     ensure_default_config_home();
     notify_pending_plugins();
+    reconcile_orphaned_agents_best_effort();
     // В интерактивном терминале запускаем полноэкранное приложение; в pipe-режиме
     // (скрипты, дочерний процесс mux) остаёмся на строчном REPL.
     if io::stdin().is_terminal() && io::stdout().is_terminal() {
@@ -1885,6 +1897,12 @@ fn run_repl(
                 }
                 editor.push_history(input);
                 cli.run_turn(&trimmed)?;
+                for notice in tools::drain_agent_notifications() {
+                    println!(
+                        "agent {} ({}) → {}",
+                        notice.name, notice.agent_id, notice.status
+                    );
+                }
             }
             input::ReadOutcome::Cancel => {}
             input::ReadOutcome::Exit => {

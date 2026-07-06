@@ -621,6 +621,46 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             required_permission: PermissionMode::ReadOnly,
         },
         ToolSpec {
+            name: "AgentGet",
+            description: "Read a background sub-agent's manifest (status, result, blocker) by id.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "agent_id": { "type": "string" }
+                },
+                "required": ["agent_id"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "AgentList",
+            description: "List background sub-agents, optionally filtered by status (e.g. running).",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "status": { "type": "string" }
+                },
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "AgentWait",
+            description: "Block until a background sub-agent reaches a terminal state or the timeout elapses.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "agent_id": { "type": "string" },
+                    "timeout_ms": { "type": "integer", "minimum": 0 },
+                    "poll_interval_ms": { "type": "integer", "minimum": 0 }
+                },
+                "required": ["agent_id"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
             name: "ToolSearch",
             description: "Search for deferred or specialized tools by exact name or keywords.",
             input_schema: json!({
@@ -1230,6 +1270,9 @@ fn execute_tool_with_enforcer(
         "TodoWrite" => from_value::<TodoWriteInput>(input).and_then(run_todo_write),
         "Skill" => from_value::<SkillInput>(input).and_then(run_skill),
         "Agent" => from_value::<AgentInput>(input).and_then(run_agent),
+        "AgentGet" => from_value::<AgentIdInput>(input).and_then(run_agent_get),
+        "AgentList" => from_value::<AgentListInput>(input).and_then(run_agent_list),
+        "AgentWait" => from_value::<AgentWaitInput>(input).and_then(run_agent_wait),
         "ToolSearch" => from_value::<ToolSearchInput>(input).and_then(run_tool_search),
         "NotebookEdit" => from_value::<NotebookEditInput>(input).and_then(run_notebook_edit),
         "Sleep" => from_value::<SleepInput>(input).and_then(run_sleep),
@@ -1996,6 +2039,18 @@ fn run_agent(input: AgentInput) -> Result<String, String> {
     to_pretty_json(execute_agent(input)?)
 }
 
+fn run_agent_get(input: AgentIdInput) -> Result<String, String> {
+    to_pretty_json(load_agent_manifest(&input.agent_id)?)
+}
+
+fn run_agent_list(input: AgentListInput) -> Result<String, String> {
+    to_pretty_json(list_agent_manifests(input.status.as_deref())?)
+}
+
+fn run_agent_wait(input: AgentWaitInput) -> Result<String, String> {
+    to_pretty_json(wait_for_agent(&input)?)
+}
+
 fn run_tool_search(input: ToolSearchInput) -> Result<String, String> {
     to_pretty_json(execute_tool_search(input))
 }
@@ -2119,6 +2174,28 @@ struct AgentInput {
     subagent_type: Option<String>,
     name: Option<String>,
     model: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentIdInput {
+    #[serde(alias = "agentId")]
+    agent_id: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct AgentListInput {
+    status: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentWaitInput {
+    #[serde(alias = "agentId")]
+    agent_id: String,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+    #[serde(default)]
+    poll_interval_ms: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2406,6 +2483,14 @@ struct AgentOutput {
     current_blocker: Option<LaneEventBlocker>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    /// PID процесса, владеющего фоновым потоком, пока `status == "running"`.
+    /// Нужен для реконсиляции «осиротевших» агентов после перезапуска процесса.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pid: Option<u32>,
+    /// Финальный текст под-агента (машиночитаемый), заполняется при завершении.
+    /// Позволяет `AgentGet`/`AgentWait` вернуть результат без парсинга `.md`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    result: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -3073,6 +3158,15 @@ fn resolve_skill_path(skill: &str) -> Result<std::path::PathBuf, String> {
 const DEFAULT_AGENT_MODEL: &str = "claude-opus-4-6";
 const DEFAULT_AGENT_SYSTEM_DATE: &str = "2026-03-31";
 const DEFAULT_AGENT_MAX_ITERATIONS: usize = 32;
+/// Сколько под-агентов может *фактически* работать одновременно. Ограничивает
+/// параллельные обращения к (слабой/локальной) модели, а не число потоков —
+/// лишние задания блокируются на семафоре внутри своего потока-супервизора.
+/// Переопределяется через `CLAWD_AGENT_CONCURRENCY` (0/пусто → дефолт).
+const DEFAULT_AGENT_CONCURRENCY: usize = 4;
+/// Wall-clock лимит на один запуск под-агента поверх [`DEFAULT_AGENT_MAX_ITERATIONS`].
+/// Защищает от зависания на мёртвом сокете локального инференс-сервера.
+/// Переопределяется через `CLAWD_AGENT_TIMEOUT_SECS` (0 → без таймаута).
+const DEFAULT_AGENT_TIMEOUT_SECS: u64 = 600;
 
 fn execute_agent(input: AgentInput) -> Result<AgentOutput, String> {
     execute_agent_with_spawn(input, spawn_agent_job)
@@ -3138,6 +3232,8 @@ where
         lane_events: vec![LaneEvent::started(iso8601_now())],
         current_blocker: None,
         error: None,
+        pid: Some(std::process::id()),
+        result: None,
     };
     write_agent_manifest(&manifest)?;
 
@@ -3161,36 +3257,319 @@ fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
     let thread_name = format!("clawd-agent-{}", job.manifest.agent_id);
     std::thread::Builder::new()
         .name(thread_name)
-        .spawn(move || {
-            let result =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_agent_job(&job)));
-            match result {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => {
-                    let _ =
-                        persist_agent_terminal_state(&job.manifest, "failed", None, Some(error));
-                }
-                Err(_) => {
-                    let _ = persist_agent_terminal_state(
-                        &job.manifest,
-                        "failed",
-                        None,
-                        Some(String::from("sub-agent thread panicked")),
-                    );
-                }
-            }
-        })
+        .spawn(move || supervise_agent_job(&job))
         .map(|_| ())
         .map_err(|error| error.to_string())
 }
 
-fn run_agent_job(job: &AgentJob) -> Result<(), String> {
+/// Поток-супервизор одного под-агента: удерживает слот семафора (ограничение
+/// параллелизма), запускает рабочий поток, ждёт результат до wall-clock таймаута
+/// и ровно один раз фиксирует терминальное состояние. Паника рабочего потока →
+/// `failed`, истёкший таймаут → `timed_out`. По завершении публикует уведомление
+/// для главного цикла (см. [`drain_agent_notifications`]).
+fn supervise_agent_job(job: &AgentJob) {
+    let _permit = acquire_agent_permit();
+
+    let (tx, rx) = std::sync::mpsc::channel::<Result<String, String>>();
+    let worker_job = job.clone();
+    let worker = std::thread::Builder::new()
+        .name(format!("clawd-agent-work-{}", job.manifest.agent_id))
+        .spawn(move || {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_agent_job(&worker_job)
+            }));
+            let message = match outcome {
+                Ok(result) => result,
+                Err(_) => Err(String::from("sub-agent thread panicked")),
+            };
+            let _ = tx.send(message);
+        });
+    if let Err(error) = worker {
+        finalize_agent(
+            &job.manifest,
+            "failed",
+            None,
+            Some(format!("failed to spawn sub-agent worker: {error}")),
+        );
+        return;
+    }
+
+    let (status, result, error) = match agent_timeout() {
+        Some(timeout) => match rx.recv_timeout(timeout) {
+            Ok(Ok(text)) => ("completed", Some(text), None),
+            Ok(Err(err)) => ("failed", None, Some(err)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => (
+                "timed_out",
+                None,
+                Some(format!(
+                    "wall-clock timeout after {}s; worker thread was left running",
+                    timeout.as_secs()
+                )),
+            ),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => (
+                "failed",
+                None,
+                Some(String::from("sub-agent worker disconnected")),
+            ),
+        },
+        None => match rx.recv() {
+            Ok(Ok(text)) => ("completed", Some(text), None),
+            Ok(Err(err)) => ("failed", None, Some(err)),
+            Err(_) => (
+                "failed",
+                None,
+                Some(String::from("sub-agent worker disconnected")),
+            ),
+        },
+    };
+    finalize_agent(&job.manifest, status, result.as_deref(), error);
+    // `_permit` освобождается здесь: слот возвращается в семафор даже если
+    // рабочий поток после таймаута всё ещё дорабатывает (осознанный компромисс —
+    // иначе зависший воркер держал бы слот вечно).
+}
+
+/// Записывает терминальное состояние и публикует уведомление о завершении.
+fn finalize_agent(manifest: &AgentOutput, status: &str, result: Option<&str>, error: Option<String>) {
+    let _ = persist_agent_terminal_state(manifest, status, result, error);
+    push_agent_notification(manifest, status);
+}
+
+fn run_agent_job(job: &AgentJob) -> Result<String, String> {
     let mut runtime = build_agent_runtime(job)?.with_max_iterations(DEFAULT_AGENT_MAX_ITERATIONS);
     let summary = runtime
         .run_turn(job.prompt.clone(), None)
         .map_err(|error| error.to_string())?;
-    let final_text = final_assistant_text(&summary);
-    persist_agent_terminal_state(&job.manifest, "completed", Some(final_text.as_str()), None)
+    Ok(final_assistant_text(&summary))
+}
+
+fn agent_concurrency_limit() -> usize {
+    std::env::var("CLAWD_AGENT_CONCURRENCY")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|limit| *limit > 0)
+        .unwrap_or(DEFAULT_AGENT_CONCURRENCY)
+}
+
+fn agent_timeout() -> Option<Duration> {
+    let secs = std::env::var("CLAWD_AGENT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_AGENT_TIMEOUT_SECS);
+    (secs > 0).then(|| Duration::from_secs(secs))
+}
+
+/// Счётный семафор доступных слотов под-агентов. Ёмкость читается из env один
+/// раз при первом обращении (ленивая инициализация).
+fn agent_semaphore() -> &'static (std::sync::Mutex<usize>, std::sync::Condvar) {
+    use std::sync::{Condvar, Mutex, OnceLock};
+    static SEM: OnceLock<(Mutex<usize>, Condvar)> = OnceLock::new();
+    SEM.get_or_init(|| (Mutex::new(agent_concurrency_limit()), Condvar::new()))
+}
+
+/// RAII-разрешение семафора: занимает слот при получении, возвращает при drop.
+struct AgentPermit;
+
+fn acquire_agent_permit() -> AgentPermit {
+    let (mutex, condvar) = agent_semaphore();
+    let mut available = mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    while *available == 0 {
+        available = condvar
+            .wait(available)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    }
+    *available -= 1;
+    AgentPermit
+}
+
+impl Drop for AgentPermit {
+    fn drop(&mut self) {
+        let (mutex, condvar) = agent_semaphore();
+        let mut available = mutex
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *available += 1;
+        condvar.notify_one();
+    }
+}
+
+/// Уведомление о завершении фонового под-агента для главного цикла (REPL/TUI).
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentNotification {
+    #[serde(rename = "agentId")]
+    pub agent_id: String,
+    pub name: String,
+    pub status: String,
+    #[serde(rename = "emittedAt")]
+    pub emitted_at: String,
+}
+
+fn agent_notification_queue() -> &'static std::sync::Mutex<Vec<AgentNotification>> {
+    use std::sync::{Mutex, OnceLock};
+    static QUEUE: OnceLock<Mutex<Vec<AgentNotification>>> = OnceLock::new();
+    QUEUE.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn push_agent_notification(manifest: &AgentOutput, status: &str) {
+    let notification = AgentNotification {
+        agent_id: manifest.agent_id.clone(),
+        name: manifest.name.clone(),
+        status: status.to_string(),
+        emitted_at: iso8601_now(),
+    };
+    if let Ok(mut queue) = agent_notification_queue().lock() {
+        queue.push(notification);
+    }
+}
+
+/// Забирает и очищает накопленные уведомления о завершении под-агентов. Главный
+/// цикл вызывает это между ходами, чтобы показать «agent … completed», не
+/// блокируясь на фоновых задачах.
+#[must_use]
+pub fn drain_agent_notifications() -> Vec<AgentNotification> {
+    agent_notification_queue()
+        .lock()
+        .map(|mut queue| std::mem::take(&mut *queue))
+        .unwrap_or_default()
+}
+
+/// Помечает «осиротевшие» под-агенты (`status == "running"`, чей процесс уже не
+/// жив) как `interrupted`. Вызывается при старте CLI: фоновые потоки не
+/// переживают перезапуск процесса, иначе их манифесты навсегда зависают в
+/// `running`. Живого владельца (например, параллельный процесс claw) не трогает.
+/// Возвращает число реконсилированных агентов.
+pub fn reconcile_orphaned_agents() -> Result<usize, String> {
+    let dir = agent_store_dir()?;
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error.to_string()),
+    };
+    let mut reconciled = 0;
+    for path in entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
+    {
+        let Ok(contents) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(manifest) = serde_json::from_str::<AgentOutput>(&contents) else {
+            continue;
+        };
+        if manifest.status != "running" {
+            continue;
+        }
+        if manifest.pid.is_some_and(process_is_alive) {
+            continue;
+        }
+        if persist_agent_terminal_state(
+            &manifest,
+            "interrupted",
+            None,
+            Some(String::from("process exited before the sub-agent finished")),
+        )
+        .is_ok()
+        {
+            reconciled += 1;
+        }
+    }
+    Ok(reconciled)
+}
+
+/// Best-effort проверка, что процесс `pid` ещё жив. Свой PID считаем живым без
+/// проверки. На unix используем `kill -0` (сигнал не шлётся, только проверка
+/// прав/существования); на прочих платформах чужой процесс считаем мёртвым —
+/// фоновые потоки не переживают рестарт, поэтому реконсиляция безопасна.
+fn process_is_alive(pid: u32) -> bool {
+    if pid == std::process::id() {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map_or(false, |status| status.success())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+fn agent_manifest_path(agent_id: &str) -> Result<PathBuf, String> {
+    let trimmed = agent_id.trim();
+    if trimmed.is_empty() {
+        return Err(String::from("agent_id must not be empty"));
+    }
+    // Защита от path traversal: agent-id имеет вид `agent-<nanos>`, без разделителей.
+    if trimmed.contains(['/', '\\']) || trimmed.contains("..") {
+        return Err(format!("invalid agent_id: {trimmed}"));
+    }
+    Ok(agent_store_dir()?.join(format!("{trimmed}.json")))
+}
+
+fn load_agent_manifest(agent_id: &str) -> Result<AgentOutput, String> {
+    let path = agent_manifest_path(agent_id)?;
+    let contents = std::fs::read_to_string(&path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            format!("no such agent: {}", agent_id.trim())
+        } else {
+            error.to_string()
+        }
+    })?;
+    serde_json::from_str::<AgentOutput>(&contents).map_err(|error| error.to_string())
+}
+
+fn list_agent_manifests(status_filter: Option<&str>) -> Result<Vec<AgentOutput>, String> {
+    let dir = agent_store_dir()?;
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.to_string()),
+    };
+    let filter = status_filter.map(str::trim).filter(|value| !value.is_empty());
+    let mut manifests = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
+        .filter_map(|path| std::fs::read_to_string(&path).ok())
+        .filter_map(|contents| serde_json::from_str::<AgentOutput>(&contents).ok())
+        .filter(|manifest| match filter {
+            Some(status) => manifest.status == status,
+            None => true,
+        })
+        .collect::<Vec<_>>();
+    // Стабильный порядок по id (`agent-<nanos>` лексикографически = хронологически).
+    manifests.sort_by(|left, right| left.agent_id.cmp(&right.agent_id));
+    Ok(manifests)
+}
+
+/// Блокирующе опрашивает манифест, пока агент не выйдет из `running` либо не
+/// истечёт `timeout_ms`. При таймауте возвращает текущий манифест (со `status ==
+/// "running"`) — вызывающая сторона сама решает, ждать ли дальше.
+fn wait_for_agent(input: &AgentWaitInput) -> Result<AgentOutput, String> {
+    let deadline = input
+        .timeout_ms
+        .filter(|ms| *ms > 0)
+        .map(|ms| Instant::now() + Duration::from_millis(ms));
+    let poll = Duration::from_millis(input.poll_interval_ms.filter(|ms| *ms > 0).unwrap_or(250));
+    loop {
+        let manifest = load_agent_manifest(&input.agent_id)?;
+        if manifest.status != "running" {
+            return Ok(manifest);
+        }
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Ok(manifest);
+        }
+        std::thread::sleep(poll);
+    }
 }
 
 fn build_agent_runtime(
@@ -3350,6 +3729,12 @@ fn persist_agent_terminal_state(
     next_manifest.completed_at = Some(iso8601_now());
     next_manifest.current_blocker = blocker.clone();
     next_manifest.error = error;
+    // Терминальное состояние → поток больше не живёт, PID неактуален.
+    next_manifest.pid = None;
+    next_manifest.result = result
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
     if let Some(blocker) = blocker {
         next_manifest.lane_events.push(
             LaneEvent::blocked(iso8601_now(), &blocker),
@@ -5006,10 +5391,11 @@ mod tests {
 
     use super::{
         agent_permission_policy, allowed_tools_for_subagent, classify_lane_failure,
-        execute_agent_with_spawn, execute_tool, final_assistant_text, mvp_tool_specs,
-        permission_mode_from_plugin, persist_agent_terminal_state, push_output_block,
-        run_task_packet, AgentInput, AgentJob, GlobalToolRegistry, LaneEventName,
-        LaneFailureClass, SubagentToolExecutor,
+        drain_agent_notifications, execute_agent_with_spawn, execute_tool, final_assistant_text,
+        list_agent_manifests, load_agent_manifest, mvp_tool_specs, permission_mode_from_plugin,
+        persist_agent_terminal_state, push_output_block, reconcile_orphaned_agents, run_task_packet,
+        AgentInput, AgentJob, GlobalToolRegistry, LaneEventName, LaneFailureClass,
+        SubagentToolExecutor,
     };
     use api::OutputContentBlock;
     use runtime::{
@@ -5998,6 +6384,144 @@ mod tests {
             spawn_error_manifest_json["currentBlocker"]["failureClass"],
             "infra"
         );
+
+        std::env::remove_var("CLAWD_AGENT_STORE");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn agent_get_list_and_wait_read_back_terminal_state() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = temp_path("agent-readback");
+        std::env::set_var("CLAWD_AGENT_STORE", &dir);
+
+        // Один агент доводим до completed с машиночитаемым результатом…
+        let completed = execute_agent_with_spawn(
+            AgentInput {
+                description: "Summarize the diff".to_string(),
+                prompt: "Summarize".to_string(),
+                subagent_type: Some("Explore".to_string()),
+                name: Some("summary".to_string()),
+                model: None,
+            },
+            |job| {
+                persist_agent_terminal_state(&job.manifest, "completed", Some("all green"), None)
+            },
+        )
+        .expect("agent should spawn");
+
+        // …и второй оставляем в running (кастомный spawn ничего не пишет).
+        let running = execute_agent_with_spawn(
+            AgentInput {
+                description: "Long task".to_string(),
+                prompt: "Work".to_string(),
+                subagent_type: None,
+                name: Some("long".to_string()),
+                model: None,
+            },
+            |_| Ok(()),
+        )
+        .expect("agent should spawn");
+
+        // AgentGet возвращает результат из манифеста, без парсинга .md.
+        let got = execute_tool("AgentGet", &json!({ "agent_id": completed.agent_id }))
+            .expect("AgentGet should succeed");
+        let got_json: serde_json::Value = serde_json::from_str(&got).expect("valid json");
+        assert_eq!(got_json["status"], "completed");
+        assert_eq!(got_json["result"], "all green");
+        assert!(got_json["pid"].is_null(), "terminal state clears pid");
+
+        // Прямой доступ по несуществующему id — понятная ошибка.
+        assert!(load_agent_manifest("agent-missing").is_err());
+
+        // AgentList без фильтра видит оба; с фильтром — только running.
+        let all = list_agent_manifests(None).expect("list");
+        assert_eq!(all.len(), 2);
+        let only_running = list_agent_manifests(Some("running")).expect("list running");
+        assert_eq!(only_running.len(), 1);
+        assert_eq!(only_running[0].agent_id, running.agent_id);
+
+        // AgentWait по завершённому агенту возвращается сразу с терминальным статусом.
+        let waited = execute_tool(
+            "AgentWait",
+            &json!({ "agent_id": completed.agent_id, "timeout_ms": 1000 }),
+        )
+        .expect("AgentWait should succeed");
+        let waited_json: serde_json::Value = serde_json::from_str(&waited).expect("valid json");
+        assert_eq!(waited_json["status"], "completed");
+
+        // По ещё бегущему агенту AgentWait с коротким таймаутом возвращает running.
+        let waited_running = execute_tool(
+            "AgentWait",
+            &json!({ "agent_id": running.agent_id, "timeout_ms": 50, "poll_interval_ms": 10 }),
+        )
+        .expect("AgentWait should time out gracefully");
+        let waited_running_json: serde_json::Value =
+            serde_json::from_str(&waited_running).expect("valid json");
+        assert_eq!(waited_running_json["status"], "running");
+
+        std::env::remove_var("CLAWD_AGENT_STORE");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn reconcile_marks_dead_owner_running_agents_as_interrupted() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = temp_path("agent-reconcile");
+        std::env::set_var("CLAWD_AGENT_STORE", &dir);
+        let _ = drain_agent_notifications(); // очистить очередь от других тестов
+
+        // running-агент с чужим, заведомо мёртвым PID — «осиротевший».
+        let orphan = execute_agent_with_spawn(
+            AgentInput {
+                description: "Orphaned task".to_string(),
+                prompt: "Work".to_string(),
+                subagent_type: None,
+                name: Some("orphan".to_string()),
+                model: None,
+            },
+            |_| Ok(()),
+        )
+        .expect("agent should spawn");
+        // Подменяем pid на несуществующий процесс (PID 2^31-1 практически недостижим).
+        let mut manifest_json: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&orphan.manifest_file).expect("read manifest"),
+        )
+        .expect("valid json");
+        manifest_json["pid"] = json!(2_147_483_646u32);
+        std::fs::write(
+            &orphan.manifest_file,
+            serde_json::to_string_pretty(&manifest_json).expect("serialize"),
+        )
+        .expect("write manifest");
+
+        // completed-агент реконсиляцию не трогает.
+        let done = execute_agent_with_spawn(
+            AgentInput {
+                description: "Finished task".to_string(),
+                prompt: "Work".to_string(),
+                subagent_type: None,
+                name: Some("done".to_string()),
+                model: None,
+            },
+            |job| persist_agent_terminal_state(&job.manifest, "completed", Some("ok"), None),
+        )
+        .expect("agent should spawn");
+
+        let reconciled = reconcile_orphaned_agents().expect("reconcile");
+        assert_eq!(reconciled, 1, "only the orphaned running agent is reconciled");
+
+        let orphan_after = load_agent_manifest(&orphan.agent_id).expect("orphan manifest");
+        assert_eq!(orphan_after.status, "interrupted");
+        let done_after = load_agent_manifest(&done.agent_id).expect("done manifest");
+        assert_eq!(done_after.status, "completed");
+
+        // Повторный прогон уже ничего не меняет (идемпотентность).
+        assert_eq!(reconcile_orphaned_agents().expect("reconcile again"), 0);
 
         std::env::remove_var("CLAWD_AGENT_STORE");
         let _ = std::fs::remove_dir_all(dir);
