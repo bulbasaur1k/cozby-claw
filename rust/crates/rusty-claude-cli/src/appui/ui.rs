@@ -3,6 +3,9 @@
 //! стримингом, многострочный ввод с автодополнением, футер, подтверждения, темы.
 //! Мышь НЕ захватывается — нативное выделение/копирование терминала работает.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant, SystemTime};
@@ -17,15 +20,22 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
+use pulldown_cmark::{
+    CodeBlockKind, Event as MdEvent, HeadingLevel, Options, Parser, Tag, TagEnd,
+};
 use runtime::{ContentBlock, MessageRole, PermissionMode, Session};
 use tui_textarea::{CursorMove, TextArea};
 
+use super::highlight;
 use super::icons;
 use super::protocol::{Activity, AgentHandle, AgentToUi, UiToAgent};
 use super::worker;
 
 const COMMANDS: &[&str] = &[
-    "/model", "/memory", "/diff", "/config", "/theme", "/clear", "/help", "/quit",
+    "/commit", "/review", "/pr", "/security-review", "/init", "/model", "/plan", "/permissions",
+    "/compact", "/rewind", "/tasks", "/rename", "/session", "/mcp", "/skills", "/agents",
+    "/external", "/brain", "/hooks", "/sandbox", "/memory", "/diff", "/config", "/version",
+    "/keymap", "/theme", "/clear", "/help", "/quit",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,6 +47,8 @@ enum Role {
     ToolResult,
     Error,
     System,
+    /// Раскрашенный unified-diff (правки Edit/Write) — рендерится моно-панелью.
+    Diff,
 }
 
 struct Entry {
@@ -193,7 +205,13 @@ impl Tab {
             AgentToUi::Text(text) => self.append_stream(Role::Assistant, &text),
             AgentToUi::Thinking(text) => self.append_stream(Role::Thinking, &text),
             AgentToUi::ToolCall { name, input } => {
-                self.push(Role::Tool, format!("{name}  {}", first_line(&input, 200)));
+                if let Some(diff) = build_edit_diff(&name, &input) {
+                    let path = edit_path(&input).unwrap_or_default();
+                    self.push(Role::Tool, format!("{name}  {path}"));
+                    self.push(Role::Diff, diff);
+                } else {
+                    self.push(Role::Tool, format!("{name}  {}", first_line(&input, 200)));
+                }
             }
             AgentToUi::ToolResult { output, is_error } => self.push(
                 if is_error { Role::Error } else { Role::ToolResult },
@@ -253,6 +271,27 @@ struct App {
     frame_tick: usize,
     sidebar_collapsed: bool,
     should_quit: bool,
+    /// Кэш подсвеченных блоков кода: hash(lang, code, width) → строки.
+    hl_cache: RefCell<HashMap<u64, Vec<Line<'static>>>>,
+    /// Текущий vim-режим ввода (модальный ввод — всегда включён).
+    vim_mode: VimMode,
+    /// Ожидающий оператор vim (`d`/`c`/`g`) для двухклавишных команд (dd, dw, gg, gt).
+    vim_pending: Option<char>,
+    /// Куда направлен фокус клавиатуры: основная область или меню сессий.
+    focus: Focus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VimMode {
+    Normal,
+    Insert,
+}
+
+/// Фокус клавиатуры: ввод/история или список сессий (сайдбар).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Focus {
+    Main,
+    Sidebar,
 }
 
 /// Запускает приложение.
@@ -301,14 +340,13 @@ impl App {
             frame_tick: 0,
             sidebar_collapsed: false,
             should_quit: false,
+            hl_cache: RefCell::new(HashMap::new()),
+            vim_mode: VimMode::Insert,
+            vim_pending: None,
+            focus: Focus::Main,
         };
         if app.active().entries.is_empty() {
-            app.active_mut().push(
-                Role::System,
-                "cozby-claw. /help — команды, Ctrl+N — вкладка, Ctrl+F/Ctrl+B — переключить, \
-                 Ctrl+E — свернуть сайдбар, Ctrl+T — тема."
-                    .to_string(),
-            );
+            app.active_mut().push(Role::System, keymap_text());
         }
         app
     }
@@ -382,6 +420,10 @@ impl App {
             self.on_modal_key(key);
             return;
         }
+        if self.focus == Focus::Sidebar {
+            self.handle_sidebar_key(key);
+            return;
+        }
         if self.compl.is_some() {
             match key.code {
                 KeyCode::Up => {
@@ -435,9 +477,13 @@ impl App {
             }
             KeyCode::Char('t') if ctrl => self.theme = next_theme(self.theme),
             KeyCode::Esc => {
-                if self.active().running {
+                if self.vim_mode == VimMode::Insert {
+                    self.vim_mode = VimMode::Normal;
+                    self.vim_pending = None;
+                } else if self.active().running {
                     self.cancel_turn();
                 } else {
+                    self.vim_pending = None;
                     self.reset_input();
                 }
             }
@@ -452,7 +498,11 @@ impl App {
             KeyCode::Enter if alt || shift => self.input.insert_newline(),
             KeyCode::Enter => self.submit(),
             _ => {
-                self.input.input(key);
+                if self.vim_mode == VimMode::Normal {
+                    self.handle_vim_normal(key);
+                } else {
+                    self.input.input(key);
+                }
             }
         }
         self.recompute_completion();
@@ -511,7 +561,9 @@ impl App {
     fn new_tab(&mut self) {
         let id = self.next_id;
         self.next_id += 1;
-        self.tabs.push(Tab::new(id, &self.model, self.mode));
+        let mut tab = Tab::new(id, &self.model, self.mode);
+        tab.push(Role::System, keymap_text());
+        self.tabs.push(tab);
         self.active = self.tabs.len() - 1;
     }
 
@@ -580,8 +632,11 @@ impl App {
     }
 
     fn handle_command(&mut self, command: &str) -> bool {
-        let mut parts = command.split_whitespace();
-        let name = parts.next().unwrap_or_default();
+        let name = command.split_whitespace().next().unwrap_or_default();
+        // Сырой остаток после имени команды (для хендлеров, берущих строку аргументов).
+        let rest = command[name.len()..].trim();
+        let args = (!rest.is_empty()).then_some(rest);
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         match name {
             "quit" | "exit" | "q" => {
                 self.should_quit = true;
@@ -594,36 +649,126 @@ impl App {
                 true
             }
             "theme" => {
-                self.theme = parts
-                    .next()
-                    .map_or_else(|| next_theme(self.theme), theme_by_name);
+                self.theme = args.map_or_else(|| next_theme(self.theme), theme_by_name);
                 configure_input(&mut self.input, self.theme);
                 let name = self.theme.name.to_string();
                 self.active_mut().push(Role::System, format!("тема: {name}"));
                 true
             }
-            "memory" => {
-                self.run_report(crate::render_memory_report());
+            "keymap" | "keys" => {
+                self.active_mut().push(Role::System, keymap_text());
                 true
             }
-            "diff" => {
-                self.run_report(crate::render_diff_report());
+            // --- read-only отчёты (движок общий с REPL) --------------------------
+            "memory" => self.report(crate::render_memory_report()),
+            "diff" => self.report(crate::render_diff_report()),
+            "config" => self.report(crate::render_config_report(args)),
+            "mcp" => self.report(commands::handle_mcp_slash_command(args, &cwd).map_err(Into::into)),
+            "skills" => {
+                self.report(commands::handle_skills_slash_command(args, &cwd).map_err(Into::into))
+            }
+            "agents" => {
+                self.report(commands::handle_agents_slash_command(args, &cwd).map_err(Into::into))
+            }
+            "external" => {
+                self.report(commands::handle_external_slash_command(args, &cwd).map_err(Into::into))
+            }
+            "brain" => {
+                self.report(commands::handle_brain_slash_command(args, &cwd).map_err(Into::into))
+            }
+            "hooks" => self.report(crate::render_hooks_report_for(&cwd)),
+            "sandbox" => self.report(crate::render_sandbox_report_for(&cwd)),
+            "version" => {
+                self.active_mut()
+                    .push(Role::System, crate::render_version_report());
                 true
             }
-            "config" => {
-                self.run_report(crate::render_config_report(parts.next()));
+            "tasks" => self.report(
+                tools::execute_tool("TaskList", &serde_json::json!({})).map_err(Into::into),
+            ),
+            // --- stateful -------------------------------------------------------
+            "compact" => {
+                self.compact_active();
+                true
+            }
+            "plan" => {
+                self.toggle_plan_mode();
+                true
+            }
+            "rewind" => {
+                let n = args.and_then(|a| a.parse::<usize>().ok()).unwrap_or(1);
+                self.rewind_active(n);
+                true
+            }
+            "rename" => {
+                match args {
+                    Some(title) => {
+                        let title = first_line(title, 24);
+                        self.active_mut().title = title;
+                    }
+                    None => self
+                        .active_mut()
+                        .push(Role::System, "использование: /rename <название>".to_string()),
+                }
+                true
+            }
+            "permissions" | "perm" => {
+                match args {
+                    None => {
+                        let mode = mode_label(self.active().mode);
+                        self.active_mut().push(
+                            Role::System,
+                            format!("режим доступа: {mode}\nсменить: /permissions <read-only|workspace-write|danger-full-access>"),
+                        );
+                    }
+                    Some(_) if self.active().running => self.active_mut().push(
+                        Role::System,
+                        "дождитесь завершения хода, затем /permissions <режим>".to_string(),
+                    ),
+                    Some(label) => match parse_permission_label(label) {
+                        Some(mode) => {
+                            let model = self.active().model.clone();
+                            if self.respawn_active(model, mode) {
+                                self.active_mut()
+                                    .push(Role::System, format!("режим доступа: {}", mode_label(mode)));
+                            }
+                        }
+                        None => self.active_mut().push(
+                            Role::Error,
+                            "режимы: read-only · workspace-write · danger-full-access".to_string(),
+                        ),
+                    },
+                }
+                true
+            }
+            "session" | "sessions" => {
+                let tab = self.active();
+                let path = tab
+                    .save_path
+                    .as_ref()
+                    .map_or_else(|| "(не сохранена)".to_string(), |p| p.display().to_string());
+                let msg = format!(
+                    "сессия активной вкладки:\n  файл       {path}\n  записей    {}\n  вкладок    {}\n  (переключение — Ctrl+F/Ctrl+B, новая — Ctrl+N, сайдбар — Ctrl+E)",
+                    tab.entries.len(),
+                    self.tabs.len(),
+                );
+                self.active_mut().push(Role::System, msg);
+                true
+            }
+            // --- prompt-макросы: формируют промпт и запускают обычный ход -------
+            "commit" | "review" | "pr" | "security-review" | "init" => {
+                self.dispatch_macro(macro_prompt(name, args));
                 true
             }
             "model" => {
-                match parts.next() {
+                match args {
                     None => {
                         let current = self.active().model.clone();
                         let hint = providers_hint();
                         self.active_mut()
                             .push(Role::System, format!("модель: {current}\n{hint}"));
                     }
-                    Some(id) if self.active().running => {
-                        let _ = id;
+                    Some(_) if self.active().running => {
                         self.active_mut().push(
                             Role::System,
                             "дождитесь завершения хода, затем /model <id>".to_string(),
@@ -634,17 +779,224 @@ impl App {
                 true
             }
             "help" => {
+                self.active_mut().push(Role::System, app_help_text());
+                true
+            }
+            _ => {
                 self.active_mut().push(
-                    Role::System,
-                    "Команды: /model [id] /memory /diff /config [секция] /clear /theme [name] /quit.  \
-                     Вкладки: Ctrl+N новая · Ctrl+F/Ctrl+B переключить · Ctrl+W закрыть · \
-                     Ctrl+P пин · Ctrl+E свернуть сайдбар.  Enter — отправить, Alt+Enter — строка."
-                        .to_string(),
+                    Role::Error,
+                    format!("неизвестная команда /{name} — /help покажет доступные"),
                 );
                 true
             }
-            _ => false,
         }
+    }
+
+    /// Рендерит результат текстовой команды: успех → System, ошибка → Error.
+    /// Всегда «поглощает» команду (возвращает true).
+    fn report(&mut self, result: Result<String, Box<dyn std::error::Error>>) -> bool {
+        self.run_report(result);
+        true
+    }
+
+    /// Запускает prompt-макрос: показывает промпт как ход пользователя и шлёт его
+    /// воркеру обычным ходом (с инструментами). Макрос ссылается на скил, так что
+    /// процедура берётся из ~/.claw/skills — правится без пересборки.
+    fn dispatch_macro(&mut self, prompt: String) {
+        if self.active().running {
+            self.active_mut()
+                .push(Role::System, "дождитесь завершения хода".to_string());
+            return;
+        }
+        self.active_mut().push(Role::User, prompt.clone());
+        let handle_tx = self.active().handle.to_agent.clone();
+        let tab = self.active_mut();
+        tab.running = true;
+        tab.activity = Activity::Model;
+        tab.turn_start = Some(Instant::now());
+        let _ = handle_tx.send(UiToAgent::Prompt(prompt));
+    }
+
+    /// Обрабатывает клавишу в vim NORMAL-режиме (движения и правки поверх
+    /// tui-textarea). Двухклавишные команды идут через `vim_pending` (d/c/g).
+    /// Клавиши, когда фокус в меню сессий (сайдбаре): j/k — листать сессии,
+    /// Tab/Enter/Esc/h/l — вернуться в основную область.
+    fn handle_sidebar_key(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Char('c' | 'd') if ctrl => self.should_quit = true,
+            KeyCode::Char('n') if ctrl => self.new_tab(),
+            KeyCode::Char('w') if ctrl => self.close_tab(),
+            KeyCode::Char('p') if ctrl => self.toggle_pin(),
+            KeyCode::Char('j') | KeyCode::Down => self.switch(1),
+            KeyCode::Char('k') | KeyCode::Up => self.switch(-1),
+            KeyCode::Tab | KeyCode::BackTab | KeyCode::Enter | KeyCode::Esc
+            | KeyCode::Char('l' | 'h' | 'q') => self.focus = Focus::Main,
+            _ => {}
+        }
+    }
+
+    fn handle_vim_normal(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+            self.focus = Focus::Sidebar;
+            self.sidebar_collapsed = false;
+            return;
+        }
+        let KeyCode::Char(c) = key.code else {
+            match key.code {
+                KeyCode::Left => self.input.move_cursor(CursorMove::Back),
+                KeyCode::Right => self.input.move_cursor(CursorMove::Forward),
+                KeyCode::Up => self.input.move_cursor(CursorMove::Up),
+                KeyCode::Down => self.input.move_cursor(CursorMove::Down),
+                _ => {}
+            }
+            return;
+        };
+        if ctrl {
+            if c == 'r' {
+                self.input.redo();
+            }
+            return;
+        }
+        if let Some(op) = self.vim_pending.take() {
+            self.vim_operator(op, c);
+            return;
+        }
+        match c {
+            'h' => self.input.move_cursor(CursorMove::Back),
+            'l' => self.input.move_cursor(CursorMove::Forward),
+            'j' => self.input.move_cursor(CursorMove::Down),
+            'k' => self.input.move_cursor(CursorMove::Up),
+            'w' => self.input.move_cursor(CursorMove::WordForward),
+            'b' => self.input.move_cursor(CursorMove::WordBack),
+            'e' => self.input.move_cursor(CursorMove::WordEnd),
+            '0' => self.input.move_cursor(CursorMove::Head),
+            '$' => self.input.move_cursor(CursorMove::End),
+            'G' => self.input.move_cursor(CursorMove::Bottom),
+            'i' => self.vim_mode = VimMode::Insert,
+            'a' => {
+                self.input.move_cursor(CursorMove::Forward);
+                self.vim_mode = VimMode::Insert;
+            }
+            'A' => {
+                self.input.move_cursor(CursorMove::End);
+                self.vim_mode = VimMode::Insert;
+            }
+            'I' => {
+                self.input.move_cursor(CursorMove::Head);
+                self.vim_mode = VimMode::Insert;
+            }
+            'o' => {
+                self.input.move_cursor(CursorMove::End);
+                self.input.insert_newline();
+                self.vim_mode = VimMode::Insert;
+            }
+            'O' => {
+                self.input.move_cursor(CursorMove::Head);
+                self.input.insert_newline();
+                self.input.move_cursor(CursorMove::Up);
+                self.vim_mode = VimMode::Insert;
+            }
+            'x' => {
+                self.input.delete_next_char();
+            }
+            'D' => {
+                self.input.delete_line_by_end();
+            }
+            'C' => {
+                self.input.delete_line_by_end();
+                self.vim_mode = VimMode::Insert;
+            }
+            'u' => {
+                self.input.undo();
+            }
+            'p' => {
+                self.input.paste();
+            }
+            'd' | 'c' | 'g' => self.vim_pending = Some(c),
+            _ => {}
+        }
+    }
+
+    /// Двухклавишные vim-команды: dd, dw, d$, cc, cw, gg.
+    fn vim_operator(&mut self, op: char, motion: char) {
+        match (op, motion) {
+            ('g', 'g') => self.input.move_cursor(CursorMove::Top),
+            ('g', 't') => self.switch(1),
+            ('g', 'T') => self.switch(-1),
+            ('d', 'd') => {
+                self.input.move_cursor(CursorMove::Head);
+                self.input.delete_line_by_end();
+                self.input.delete_next_char();
+            }
+            ('d', 'w') => {
+                self.input.delete_next_word();
+            }
+            ('d', '$') => {
+                self.input.delete_line_by_end();
+            }
+            ('c', 'c') => {
+                self.input.move_cursor(CursorMove::Head);
+                self.input.delete_line_by_end();
+                self.vim_mode = VimMode::Insert;
+            }
+            ('c', 'w') => {
+                self.input.delete_next_word();
+                self.vim_mode = VimMode::Insert;
+            }
+            _ => {}
+        }
+    }
+
+    /// `/compact`: сжимает сессию активной вкладки (как в REPL) и перезапускает
+    /// воркер на сжатой сессии, сохраняя её на диск.
+    fn compact_active(&mut self) {
+        if self.active().running {
+            self.active_mut().push(
+                Role::System,
+                "дождитесь завершения хода, затем /compact".to_string(),
+            );
+            return;
+        }
+        let Some(path) = self.active().save_path.clone() else {
+            self.active_mut().push(
+                Role::System,
+                "нечего сжимать: сессия ещё не сохранена — сделайте ход".to_string(),
+            );
+            return;
+        };
+        let Ok(session) = Session::load_from_path(&path) else {
+            self.active_mut()
+                .push(Role::Error, "не удалось прочитать сессию для сжатия".to_string());
+            return;
+        };
+        let result = runtime::compact_session(
+            &session,
+            runtime::CompactionConfig {
+                max_estimated_tokens: 0,
+                ..runtime::CompactionConfig::default()
+            },
+        );
+        let removed = result.removed_message_count;
+        if let Err(error) = result.compacted_session.save_to_path(&path) {
+            self.active_mut()
+                .push(Role::Error, format!("не удалось сохранить сжатую сессию: {error}"));
+            return;
+        }
+        let tab = self.active_mut();
+        tab.handle = worker::spawn_agent(
+            tab.model.clone(),
+            tab.mode,
+            result.compacted_session,
+            Some(path),
+        );
+        let message = if removed == 0 {
+            "сжатие пропущено: сессия ниже порога".to_string()
+        } else {
+            format!("сжато: удалено {removed} сообщений в резюме")
+        };
+        tab.push(Role::System, message);
     }
 
     fn run_report(&mut self, result: Result<String, Box<dyn std::error::Error>>) {
@@ -654,25 +1006,115 @@ impl App {
         }
     }
 
-    /// Переключает модель активной вкладки: перезапускает воркер на той же
-    /// (сохранённой) сессии, сохраняя историю.
-    fn switch_model(&mut self, id: &str) {
-        let model = crate::resolve_model_alias(id).to_string();
+    /// Перезапускает воркер активной вкладки на сохранённой сессии с заданными
+    /// моделью и режимом (сохраняя историю). Общая основа для /model, /plan.
+    /// `false` + сообщение, если сессия ещё не сохранена/не читается.
+    fn respawn_active(&mut self, model: String, mode: PermissionMode) -> bool {
         let tab = self.active_mut();
-        let session = tab
-            .save_path
-            .as_ref()
-            .and_then(|path| Session::load_from_path(path).ok());
-        let Some(session) = session else {
+        let Some(path) = tab.save_path.clone() else {
             tab.push(
                 Role::System,
-                "нельзя сменить модель: сессия ещё не сохранена — сделайте ход".to_string(),
+                "сначала сделайте ход — сессия ещё не сохранена".to_string(),
+            );
+            return false;
+        };
+        let Ok(session) = Session::load_from_path(&path) else {
+            tab.push(Role::Error, "не удалось прочитать сессию".to_string());
+            return false;
+        };
+        tab.handle = worker::spawn_agent(model.clone(), mode, session, Some(path));
+        tab.model = model;
+        tab.mode = mode;
+        true
+    }
+
+    /// Переключает модель активной вкладки (режим сохраняется).
+    fn switch_model(&mut self, id: &str) {
+        let model = crate::resolve_model_alias(id).to_string();
+        let mode = self.active().mode;
+        if self.respawn_active(model.clone(), mode) {
+            self.active_mut()
+                .push(Role::System, format!("модель переключена: {model}"));
+        }
+    }
+
+    /// `/plan`: тумблер режима планирования (read-only) — агент рассуждает и
+    /// планирует, но не может писать в файлы, пока план не выключен.
+    fn toggle_plan_mode(&mut self) {
+        if self.active().running {
+            self.active_mut().push(
+                Role::System,
+                "дождитесь завершения хода, затем /plan".to_string(),
+            );
+            return;
+        }
+        let (mode, message) = if self.active().mode == PermissionMode::ReadOnly {
+            (PermissionMode::WorkspaceWrite, "plan mode выключен — правки разрешены")
+        } else {
+            (PermissionMode::ReadOnly, "plan mode включён — правки заблокированы, только чтение/план")
+        };
+        let model = self.active().model.clone();
+        if self.respawn_active(model, mode) {
+            self.active_mut().push(Role::System, message.to_string());
+        }
+    }
+
+    /// `/rewind [n]`: откатывает последние N ходов пользователя — обрезает
+    /// сессию до нужного места, сохраняет, перезапускает воркер и перестраивает
+    /// историю в UI. По умолчанию N=1.
+    fn rewind_active(&mut self, n: usize) {
+        if self.active().running {
+            self.active_mut().push(
+                Role::System,
+                "дождитесь завершения хода, затем /rewind".to_string(),
+            );
+            return;
+        }
+        let Some(path) = self.active().save_path.clone() else {
+            self.active_mut().push(
+                Role::System,
+                "нечего откатывать: сессия ещё не сохранена".to_string(),
             );
             return;
         };
-        tab.handle = worker::spawn_agent(model.clone(), tab.mode, session, tab.save_path.clone());
-        tab.model = model.clone();
-        tab.push(Role::System, format!("модель переключена: {model}"));
+        let Ok(mut session) = Session::load_from_path(&path) else {
+            self.active_mut()
+                .push(Role::Error, "не удалось прочитать сессию".to_string());
+            return;
+        };
+        let user_positions: Vec<usize> = session
+            .messages
+            .iter()
+            .enumerate()
+            .filter(|(_, message)| message.role == MessageRole::User)
+            .map(|(index, _)| index)
+            .collect();
+        if user_positions.is_empty() {
+            self.active_mut()
+                .push(Role::System, "нечего откатывать".to_string());
+            return;
+        }
+        let keep_turns = user_positions.len().saturating_sub(n.max(1));
+        let truncate_at = if keep_turns == 0 {
+            0
+        } else {
+            user_positions[keep_turns]
+        };
+        let removed = user_positions.len() - keep_turns;
+        session.messages.truncate(truncate_at);
+        if let Err(error) = session.save_to_path(&path) {
+            self.active_mut()
+                .push(Role::Error, format!("не удалось сохранить сессию: {error}"));
+            return;
+        }
+        let entries = rebuild_entries(&session);
+        let model = self.active().model.clone();
+        let mode = self.active().mode;
+        let tab = self.active_mut();
+        tab.handle = worker::spawn_agent(model, mode, session, Some(path));
+        tab.entries = entries;
+        tab.scroll_back = 0;
+        tab.push(Role::System, format!("↩ откат: убрано {removed} ход(ов)"));
     }
 
     fn cancel_turn(&mut self) {
@@ -812,11 +1254,22 @@ impl App {
                 ]));
             }
         }
-        let title = if collapsed { "" } else { " сессии " };
+        let focused = self.focus == Focus::Sidebar;
+        let title = if collapsed {
+            ""
+        } else if focused {
+            " сессии ◂ j/k "
+        } else {
+            " сессии "
+        };
+        let border = if focused { theme.accent } else { theme.muted };
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(theme.muted))
-            .title(Span::styled(title, Style::default().fg(theme.accent2)));
+            .border_style(Style::default().fg(border))
+            .title(Span::styled(
+                title,
+                Style::default().fg(if focused { theme.accent } else { theme.accent2 }),
+            ));
         frame.render_widget(
             Paragraph::new(rows).block(block).style(Style::default().bg(theme.bar_bg)),
             area,
@@ -857,6 +1310,10 @@ impl App {
                 lines.push(Line::from(""));
                 continue;
             }
+            if entry.role == Role::Diff {
+                self.push_code_block(&mut lines, &entry.text, "diff", width);
+                continue;
+            }
             let (prefix, color, dim) = match entry.role {
                 Role::User => ("▍ ", theme.accent, false),
                 Role::Thinking => ("· ", theme.muted, true),
@@ -864,7 +1321,7 @@ impl App {
                 Role::ToolResult => ("", theme.success, true),
                 Role::Error => ("✗ ", theme.error, false),
                 Role::System => ("» ", theme.muted, true),
-                Role::Assistant => unreachable!(),
+                Role::Assistant | Role::Diff => unreachable!(),
             };
             let mut style = Style::default().fg(color);
             if dim {
@@ -885,32 +1342,105 @@ impl App {
         lines
     }
 
-    /// Рендер ответа ассистента с блоками кода ```…``` (моно-панель на всю
-    /// ширину, без переноса), остальной текст — обычным переносом.
+    /// Рендер markdown-ответа ассистента в ratatui-строки: заголовки, **жирный**,
+    /// *курсив*, `инлайн-код`, списки, цитаты, правила и переносы — через
+    /// pulldown-cmark; блоки кода ```…``` — подсветка синтаксиса (syntect) моно-
+    /// панелью. Абзацы переносятся по ширине.
     fn push_markdown(&self, lines: &mut Vec<Line<'static>>, text: &str, width: usize) {
-        let theme = self.theme;
-        let code_style = Style::default()
-            .fg(Color::Rgb(200, 208, 224))
-            .bg(Color::Rgb(30, 33, 44));
+        let mut md = MdBuilder::new(self.theme, width);
         let mut in_code = false;
-        for raw in text.split('\n') {
-            if raw.trim_start().starts_with("```") {
-                in_code = !in_code;
-                continue;
-            }
-            if in_code {
-                let content: String = raw.chars().take(width.saturating_sub(1)).collect();
-                let padded = format!("{content:<width$}");
-                lines.push(Line::from(Span::styled(padded, code_style)));
-            } else {
-                for wrapped in wrap_text(raw, width) {
-                    lines.push(Line::from(Span::styled(
-                        wrapped,
-                        Style::default().fg(theme.text),
-                    )));
+        let mut code_lang = String::new();
+        let mut code_buf = String::new();
+        for event in Parser::new_ext(text, Options::all()) {
+            match event {
+                MdEvent::Start(Tag::CodeBlock(kind)) => {
+                    md.flush(lines);
+                    in_code = true;
+                    code_buf.clear();
+                    code_lang = match kind {
+                        CodeBlockKind::Fenced(lang) => lang.trim().to_ascii_lowercase(),
+                        CodeBlockKind::Indented => String::new(),
+                    };
                 }
+                MdEvent::End(TagEnd::CodeBlock) => {
+                    in_code = false;
+                    self.push_code_block(lines, code_buf.trim_end_matches('\n'), &code_lang, width);
+                    lines.push(Line::from(""));
+                }
+                MdEvent::Text(t) if in_code => code_buf.push_str(&t),
+                MdEvent::Text(t) => md.text(lines, &t),
+                MdEvent::Code(c) => md.inline_code(lines, &c),
+                MdEvent::Start(Tag::Strong) => md.strong += 1,
+                MdEvent::End(TagEnd::Strong) => md.strong = md.strong.saturating_sub(1),
+                MdEvent::Start(Tag::Emphasis) => md.emphasis += 1,
+                MdEvent::End(TagEnd::Emphasis) => md.emphasis = md.emphasis.saturating_sub(1),
+                MdEvent::Start(Tag::Link { .. }) => md.link += 1,
+                MdEvent::End(TagEnd::Link) => md.link = md.link.saturating_sub(1),
+                MdEvent::Start(Tag::Heading { level, .. }) => {
+                    md.flush(lines);
+                    md.heading = heading_rank(level);
+                }
+                MdEvent::End(TagEnd::Heading(..)) => {
+                    md.flush(lines);
+                    md.heading = 0;
+                    lines.push(Line::from(""));
+                }
+                MdEvent::End(TagEnd::Paragraph) => {
+                    md.flush(lines);
+                    lines.push(Line::from(""));
+                }
+                MdEvent::Start(Tag::List(first)) => md.list.push(first),
+                MdEvent::End(TagEnd::List(..)) => {
+                    md.list.pop();
+                    md.flush(lines);
+                }
+                MdEvent::Start(Tag::Item) => {
+                    md.flush(lines);
+                    md.start_item();
+                }
+                MdEvent::End(TagEnd::Item) => md.flush(lines),
+                MdEvent::Start(Tag::BlockQuote(..)) => md.quote += 1,
+                MdEvent::End(TagEnd::BlockQuote(..)) => {
+                    md.quote = md.quote.saturating_sub(1);
+                    md.flush(lines);
+                }
+                MdEvent::SoftBreak => md.text(lines, " "),
+                MdEvent::HardBreak => md.flush(lines),
+                MdEvent::Rule => {
+                    md.flush(lines);
+                    lines.push(rule_line(self.theme, width));
+                }
+                _ => {}
             }
         }
+        if in_code && !code_buf.is_empty() {
+            self.push_code_block(lines, code_buf.trim_end_matches('\n'), &code_lang, width);
+        }
+        md.flush(lines);
+    }
+
+    /// Добавляет подсвеченный блок кода (через кэш) в моно-панель.
+    fn push_code_block(&self, lines: &mut Vec<Line<'static>>, code: &str, lang: &str, width: usize) {
+        let code_bg = Color::Rgb(30, 33, 44);
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        lang.hash(&mut hasher);
+        code.hash(&mut hasher);
+        width.hash(&mut hasher);
+        let key = hasher.finish();
+        if let Some(cached) = self.hl_cache.borrow().get(&key) {
+            lines.extend(cached.iter().cloned());
+            return;
+        }
+        let block = highlight::highlight_block(code, lang, code_bg, width);
+        {
+            let mut cache = self.hl_cache.borrow_mut();
+            // Стриминг плодит временные ключи (растущий блок) — ограничиваем рост.
+            if cache.len() > 1024 {
+                cache.clear();
+            }
+            cache.insert(key, block.clone());
+        }
+        lines.extend(block);
     }
 
     fn draw_input(&mut self, frame: &mut Frame, area: Rect) {
@@ -923,7 +1453,7 @@ impl App {
             .first()
             .is_some_and(|line| line.starts_with('/'));
         let title = if typing_command {
-            " /model · /memory · /diff · /config · /theme · /clear · /help · /quit "
+            " /commit · /review · /pr · /model · /plan · /compact · /rewind · /mcp · /skills · /help — все в /help "
         } else {
             " ввод "
         };
@@ -956,13 +1486,28 @@ impl App {
             tab.in_tok / 1000,
             tab.out_tok / 1000,
         );
-        let line = Line::from(vec![
-            Span::styled(left, Style::default().fg(color)),
-            Span::styled(
-                format!("   {}", short_path(&self.cwd)),
-                Style::default().fg(theme.muted),
-            ),
-        ]);
+        let mut spans = vec![Span::styled(left, Style::default().fg(color))];
+        let (mode_label, mode_color) = match self.vim_mode {
+            VimMode::Normal => (" NORMAL ", theme.accent2),
+            VimMode::Insert => (" INSERT ", theme.success),
+        };
+        spans.push(Span::styled(
+            format!("  {mode_label}"),
+            Style::default().fg(mode_color).add_modifier(Modifier::BOLD),
+        ));
+        if tab.mode == PermissionMode::ReadOnly {
+            spans.push(Span::styled(
+                "   ⏸ PLAN",
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        spans.push(Span::styled(
+            format!("   {}", short_path(&self.cwd)),
+            Style::default().fg(theme.muted),
+        ));
+        let line = Line::from(spans);
         frame.render_widget(
             Paragraph::new(line).style(Style::default().bg(theme.bar_bg)),
             area,
@@ -1222,6 +1767,273 @@ fn providers_hint() -> String {
     }
 }
 
+fn mode_label(mode: PermissionMode) -> &'static str {
+    match mode {
+        PermissionMode::ReadOnly => "read-only (план: правки заблокированы)",
+        PermissionMode::WorkspaceWrite => "workspace-write (правки в проекте разрешены)",
+        PermissionMode::DangerFullAccess => "danger-full-access (без ограничений)",
+        PermissionMode::Prompt => "prompt (спрашивать по каждому действию)",
+        PermissionMode::Allow => "allow (разрешать без спроса)",
+    }
+}
+
+fn parse_permission_label(label: &str) -> Option<PermissionMode> {
+    match label.trim().to_ascii_lowercase().as_str() {
+        "read-only" | "readonly" | "plan" | "ro" => Some(PermissionMode::ReadOnly),
+        "workspace-write" | "write" | "workspace" | "edit" => Some(PermissionMode::WorkspaceWrite),
+        "danger-full-access" | "danger" | "full" | "yolo" => Some(PermissionMode::DangerFullAccess),
+        "prompt" | "ask" => Some(PermissionMode::Prompt),
+        "allow" => Some(PermissionMode::Allow),
+        _ => None,
+    }
+}
+
+/// Максимум строк на сторону в diff-панели правки (чтобы не заливать экран).
+const DIFF_MAX_LINES: usize = 40;
+
+/// Строит unified-diff-текст для правки Edit/Write из JSON-инпута тула. `None`,
+/// если это не файловая правка или инпут не распарсился.
+fn build_edit_diff(name: &str, input: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(input).ok()?;
+    match name {
+        "edit_file" => {
+            let old = value.get("old_string")?.as_str()?;
+            let new = value.get("new_string")?.as_str()?;
+            let mut out = String::new();
+            push_diff_side(&mut out, old, '-');
+            push_diff_side(&mut out, new, '+');
+            Some(out)
+        }
+        "write_file" => {
+            let content = value.get("content")?.as_str()?;
+            let mut out = String::new();
+            push_diff_side(&mut out, content, '+');
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
+/// Дописывает строки одной стороны diff с маркером (`+`/`-`), обрезая до лимита.
+fn push_diff_side(out: &mut String, text: &str, marker: char) {
+    let lines: Vec<&str> = text.lines().collect();
+    for line in lines.iter().take(DIFF_MAX_LINES) {
+        out.push(marker);
+        out.push_str(line);
+        out.push('\n');
+    }
+    if lines.len() > DIFF_MAX_LINES {
+        out.push_str(&format!("… ещё {} строк\n", lines.len() - DIFF_MAX_LINES));
+    }
+}
+
+/// Извлекает `path` из JSON-инпута файлового тула.
+fn edit_path(input: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(input).ok()?;
+    value.get("path")?.as_str().map(str::to_string)
+}
+
+/// Текст промпта для prompt-макроса. Ссылается на соответствующий прозрачный
+/// скил (~/.claw/skills), поэтому процедура редактируется без пересборки.
+fn macro_prompt(kind: &str, args: Option<&str>) -> String {
+    let extra = args.map_or_else(String::new, |a| format!("\nКонтекст: {a}"));
+    let body = match kind {
+        "commit" => "Подготовь git-коммит для текущих изменений. Используй скил `commit` \
+                     (вызови инструмент Skill со skill=commit) для точной процедуры; предложи \
+                     сообщение и команду, но не коммить без явной просьбы.",
+        "review" => "Проверь текущий diff на корректность и проблемы. Используй скил \
+                     `code-review`. Дай находки как file:line + суть + фикс.",
+        "pr" => "Составь заголовок и описание pull request для этой ветки по diff и коммитам. \
+                 Используй скил `pr-description`.",
+        "security-review" => "Проведи security-review текущего diff по чеклисту. Используй скил \
+                              `security-review`. Находки — с severity и фиксом.",
+        "init" => "Проанализируй этот проект и создай/обнови CLAUDE.md: команды сборки/тестов, \
+                   структуру, конвенции и важные детали для будущих сессий.",
+        _ => "",
+    };
+    format!("{body}{extra}")
+}
+
+/// Инкрементальный сборщик строк markdown: копит спаны текущей строки, переносит
+/// по ширине, добавляет префиксы цитат/списков. Блоки кода рендерятся отдельно.
+struct MdBuilder {
+    theme: Theme,
+    width: usize,
+    cur: Vec<Span<'static>>,
+    col: usize,
+    prefix_w: usize,
+    strong: u32,
+    emphasis: u32,
+    link: u32,
+    heading: u8,
+    quote: u32,
+    list: Vec<Option<u64>>,
+    item_prefix: Option<String>,
+}
+
+impl MdBuilder {
+    fn new(theme: Theme, width: usize) -> Self {
+        Self {
+            theme,
+            width: width.max(8),
+            cur: Vec::new(),
+            col: 0,
+            prefix_w: 0,
+            strong: 0,
+            emphasis: 0,
+            link: 0,
+            heading: 0,
+            quote: 0,
+            list: Vec::new(),
+            item_prefix: None,
+        }
+    }
+
+    fn style(&self) -> Style {
+        let mut style = Style::default().fg(self.theme.text);
+        if self.heading > 0 {
+            style = style.fg(self.theme.accent).add_modifier(Modifier::BOLD);
+        }
+        if self.strong > 0 {
+            style = style.add_modifier(Modifier::BOLD);
+        }
+        if self.emphasis > 0 {
+            style = style.add_modifier(Modifier::ITALIC);
+        }
+        if self.quote > 0 {
+            style = style.fg(self.theme.muted).add_modifier(Modifier::ITALIC);
+        }
+        if self.link > 0 {
+            style = style.fg(self.theme.accent2).add_modifier(Modifier::UNDERLINED);
+        }
+        style
+    }
+
+    /// Добавляет префикс строки (цитаты `│`, маркер списка) при её начале.
+    fn ensure_prefix(&mut self) {
+        if self.col != 0 {
+            return;
+        }
+        let mut width = 0;
+        for _ in 0..self.quote {
+            self.cur
+                .push(Span::styled("│ ", Style::default().fg(self.theme.muted)));
+            width += 2;
+        }
+        if let Some(prefix) = self.item_prefix.take() {
+            width += prefix.chars().count();
+            self.cur
+                .push(Span::styled(prefix, Style::default().fg(self.theme.accent2)));
+        }
+        self.prefix_w = width;
+        self.col = width;
+    }
+
+    fn push_word(&mut self, lines: &mut Vec<Line<'static>>, word: &str, style: Style) {
+        self.ensure_prefix();
+        let word_w = word.chars().count();
+        let need_space = self.col > self.prefix_w;
+        if self.col + word_w + usize::from(need_space) > self.width && self.col > self.prefix_w {
+            self.flush(lines);
+            self.ensure_prefix();
+        } else if need_space {
+            self.cur.push(Span::raw(" "));
+            self.col += 1;
+        }
+        self.col += word_w;
+        self.cur.push(Span::styled(word.to_string(), style));
+    }
+
+    fn text(&mut self, lines: &mut Vec<Line<'static>>, text: &str) {
+        let style = self.style();
+        for word in text.split_whitespace() {
+            self.push_word(lines, word, style);
+        }
+    }
+
+    fn inline_code(&mut self, lines: &mut Vec<Line<'static>>, code: &str) {
+        let style = Style::default()
+            .fg(Color::Rgb(224, 200, 140))
+            .bg(Color::Rgb(40, 43, 54));
+        self.push_word(lines, code, style);
+    }
+
+    fn start_item(&mut self) {
+        let indent = "  ".repeat(self.list.len().saturating_sub(1));
+        let marker = match self.list.last_mut() {
+            Some(Some(number)) => {
+                let current = *number;
+                *number += 1;
+                format!("{current}. ")
+            }
+            _ => "• ".to_string(),
+        };
+        self.item_prefix = Some(format!("{indent}{marker}"));
+    }
+
+    fn flush(&mut self, lines: &mut Vec<Line<'static>>) {
+        if !self.cur.is_empty() {
+            lines.push(Line::from(std::mem::take(&mut self.cur)));
+        }
+        self.col = 0;
+        self.prefix_w = 0;
+    }
+}
+
+fn heading_rank(level: HeadingLevel) -> u8 {
+    match level {
+        HeadingLevel::H1 => 1,
+        HeadingLevel::H2 => 2,
+        _ => 3,
+    }
+}
+
+fn rule_line(theme: Theme, width: usize) -> Line<'static> {
+    Line::from(Span::styled(
+        "─".repeat(width.max(1)),
+        Style::default().fg(theme.muted),
+    ))
+}
+
+/// Полная карта клавиш (vim-режим). Показывается в новых сессиях и по `/keymap`.
+fn keymap_text() -> String {
+    [
+        "⌨  Карта клавиш (модальный vim-ввод, INSERT по умолчанию):",
+        "  INSERT (печать):  текст · Enter — отправить · Alt/Shift+Enter — перенос строки · Esc → NORMAL",
+        "  NORMAL (Esc):     h j k l — курсор · w b e — по словам · 0 $ — края · gg G — верх/низ",
+        "     правки:        i a A I o O — вставка · x — удалить символ · dd dw D — удалить · cc cw C — заменить",
+        "                    u — отмена · Ctrl+r — повтор · p — вставить",
+        "  Сессии:           Tab — фокус в меню сессий (там j/k — листать, Tab/Enter/Esc — назад)",
+        "                    gt / gT — след/пред · Ctrl+N — новая · Ctrl+W — закрыть · Ctrl+P — закрепить",
+        "  Экран:            Ctrl+E — свернуть сайдбар · Ctrl+T — тема · PgUp/PgDn — прокрутка",
+        "  Команды:          /help — все команды · /keymap — эта справка",
+    ]
+    .join("\n")
+}
+
+fn app_help_text() -> String {
+    [
+        "Действия (запускают ход): /commit · /review · /pr · /security-review · /init",
+        "",
+        "Команды:",
+        "  /model [id]        показать/сменить модель          /plan          тумблер режима планирования",
+        "  /permissions <m>   режим доступа                    /compact       сжать контекст",
+        "  /rewind [n]        откатить N ходов (1)              /rename <имя>  переименовать вкладку",
+        "  /tasks             фоновые задачи                   /session       инфо о сессии",
+        "  /mcp [list|show]   MCP-серверы                      /skills [list] скилы",
+        "  /agents [list]     агенты                           /external      внешняя консультация",
+        "  /hooks             хуки                             /sandbox       статус песочницы",
+        "  /brain [on|off]    cozby-brain                      /config [секц] настройки",
+        "  /memory            память                           /diff          изменения git",
+        "  /version           версия                           /keymap        карта клавиш",
+        "  /theme [name]      тема                             /clear         очистить вид",
+        "  /help  /quit",
+        "Вкладки: Ctrl+N новая · Ctrl+F/Ctrl+B переключить · Ctrl+W закрыть · Ctrl+P пин · Ctrl+E сайдбар",
+        "Ввод: Enter — отправить · Alt+Enter — новая строка · @ — файлы · PgUp/PgDn — прокрутка",
+    ]
+    .join("\n")
+}
+
 fn short(text: &str, max: usize) -> String {
     if text.chars().count() <= max {
         text.to_string()
@@ -1332,4 +2144,91 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
             Constraint::Percentage((100 - percent_x) / 2),
         ])
         .split(vertical[1])[1]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        build_edit_diff, edit_path, macro_prompt, parse_permission_label, MdBuilder, THEMES,
+    };
+    use ratatui::style::Modifier;
+    use ratatui::text::Line;
+    use runtime::PermissionMode;
+
+    #[test]
+    fn markdown_wraps_long_text_and_keeps_bold() {
+        let mut builder = MdBuilder::new(THEMES[0], 20);
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        builder.strong = 1;
+        builder.text(&mut lines, "Title");
+        builder.strong = 0;
+        builder.flush(&mut lines);
+        builder.text(
+            &mut lines,
+            "one two three four five six seven eight nine ten eleven",
+        );
+        builder.flush(&mut lines);
+        assert!(lines.len() >= 2, "long paragraph must wrap");
+        assert!(
+            lines[0]
+                .spans
+                .iter()
+                .any(|span| span.style.add_modifier.contains(Modifier::BOLD)),
+            "strong text stays bold"
+        );
+    }
+
+    #[test]
+    fn markdown_list_item_gets_bullet_prefix() {
+        let mut builder = MdBuilder::new(THEMES[0], 40);
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        builder.list.push(None);
+        builder.start_item();
+        builder.text(&mut lines, "item");
+        builder.flush(&mut lines);
+        let rendered: String = lines[0]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(rendered.starts_with("• "), "bullet prefix: {rendered:?}");
+    }
+
+    #[test]
+    fn edit_diff_shows_removed_then_added_lines() {
+        let input = r#"{"path":"src/x.rs","old_string":"let a = 1;","new_string":"let a = 2;"}"#;
+        let diff = build_edit_diff("edit_file", input).expect("edit_file yields a diff");
+        assert!(diff.contains("-let a = 1;"));
+        assert!(diff.contains("+let a = 2;"));
+        assert_eq!(edit_path(input).as_deref(), Some("src/x.rs"));
+    }
+
+    #[test]
+    fn write_diff_is_all_additions() {
+        let input = r#"{"path":"new.txt","content":"line1\nline2"}"#;
+        let diff = build_edit_diff("write_file", input).expect("write_file yields a diff");
+        assert!(diff.contains("+line1"));
+        assert!(diff.contains("+line2"));
+        assert!(!diff.contains("-line1"));
+    }
+
+    #[test]
+    fn non_file_tool_has_no_diff() {
+        assert!(build_edit_diff("grep_search", r#"{"pattern":"x"}"#).is_none());
+    }
+
+    #[test]
+    fn permission_labels_parse_common_aliases() {
+        assert_eq!(parse_permission_label("plan"), Some(PermissionMode::ReadOnly));
+        assert_eq!(parse_permission_label("write"), Some(PermissionMode::WorkspaceWrite));
+        assert_eq!(parse_permission_label("yolo"), Some(PermissionMode::DangerFullAccess));
+        assert!(parse_permission_label("nonsense").is_none());
+    }
+
+    #[test]
+    fn macro_prompt_references_skill_and_context() {
+        let p = macro_prompt("commit", Some("wip auth"));
+        assert!(p.contains("commit"));
+        assert!(p.contains("wip auth"));
+    }
 }

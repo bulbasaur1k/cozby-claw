@@ -114,9 +114,6 @@ Run `claw --help` for usage."
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
-    // Seed default skills / mcp.toml / agents dir into ~/.claw on first run.
-    // Best-effort: a scaffolding failure must never block the CLI.
-    ensure_default_config_home();
     match parse_args(&args)? {
         CliAction::DumpManifests => dump_manifests(),
         CliAction::BootstrapPlan => print_bootstrap_plan(),
@@ -155,7 +152,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             allowed_tools,
             permission_mode,
         } => run_repl(model, allowed_tools, permission_mode)?,
-        CliAction::Mux { args } => mux::run(&args)?,
+        CliAction::Mux { args } => {
+            ensure_default_config_home();
+            mux::run(&args)?;
+        }
         CliAction::Help => print_help(),
     }
     Ok(())
@@ -1835,6 +1835,10 @@ fn run_repl(
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Seed default skills / hooks / mcp.toml into ~/.claw on first interactive
+    // start (best-effort; never blocks). Kept out of one-shot/introspection
+    // invocations so scripted runs stay side-effect free.
+    ensure_default_config_home();
     // В интерактивном терминале запускаем полноэкранное приложение; в pipe-режиме
     // (скрипты, дочерний процесс mux) остаёмся на строчном REPL.
     if io::stdin().is_terminal() && io::stdout().is_terminal() {
@@ -4099,6 +4103,27 @@ fn append_hook_list_entries(
         command,
         enabled,
     }));
+}
+
+/// App-facing wrapper: `/hooks` report for the given cwd (builds loader+config).
+fn render_hooks_report_for(cwd: &Path) -> Result<String, Box<dyn std::error::Error>> {
+    let loader = ConfigLoader::default_for(cwd);
+    let runtime_config = loader
+        .load()
+        .unwrap_or_else(|_| runtime::RuntimeConfig::empty());
+    render_hook_list_report_for(cwd, &loader, &runtime_config)
+}
+
+/// App-facing wrapper: `/sandbox` status report for the given cwd.
+fn render_sandbox_report_for(cwd: &Path) -> Result<String, Box<dyn std::error::Error>> {
+    let loader = ConfigLoader::default_for(cwd);
+    let runtime_config = loader
+        .load()
+        .unwrap_or_else(|_| runtime::RuntimeConfig::empty());
+    Ok(format_sandbox_report(&resolve_sandbox_status(
+        runtime_config.sandbox(),
+        cwd,
+    )))
 }
 
 fn render_config_report(section: Option<&str>) -> Result<String, Box<dyn std::error::Error>> {
