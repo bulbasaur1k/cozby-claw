@@ -122,6 +122,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         CliAction::Brain { args } => LiveCli::print_brain(args.as_deref())?,
         CliAction::External { args } => LiveCli::print_external(args.as_deref())?,
         CliAction::Skills { args } => LiveCli::print_skills(args.as_deref())?,
+        CliAction::Plugins { args } => run_plugins_command(args.as_deref())?,
         CliAction::PrintSystemPrompt { cwd, date } => print_system_prompt(cwd, date),
         CliAction::Version => print_version(),
         CliAction::ResumeSession {
@@ -206,6 +207,9 @@ enum CliAction {
         args: Option<String>,
     },
     Skills {
+        args: Option<String>,
+    },
+    Plugins {
         args: Option<String>,
     },
     PrintSystemPrompt {
@@ -421,6 +425,9 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             args: join_optional_args(&rest[1..]),
         }),
         "skills" => Ok(CliAction::Skills {
+            args: join_optional_args(&rest[1..]),
+        }),
+        "plugin" | "plugins" => Ok(CliAction::Plugins {
             args: join_optional_args(&rest[1..]),
         }),
         "system-prompt" => parse_system_prompt_args(&rest[1..]),
@@ -1839,6 +1846,7 @@ fn run_repl(
     // start (best-effort; never blocks). Kept out of one-shot/introspection
     // invocations so scripted runs stay side-effect free.
     ensure_default_config_home();
+    notify_pending_plugins();
     // В интерактивном терминале запускаем полноэкранное приложение; в pipe-режиме
     // (скрипты, дочерний процесс mux) остаёмся на строчном REPL.
     if io::stdin().is_terminal() && io::stdout().is_terminal() {
@@ -4815,6 +4823,48 @@ fn build_runtime_plugin_state_with_loader(
     })
 }
 
+/// Best-effort notice at interactive start: how many git sources in plugins.toml
+/// are not yet installed. Declarative install stays explicit (`claw plugins sync`).
+fn notify_pending_plugins() {
+    let Ok(cwd) = env::current_dir() else {
+        return;
+    };
+    let loader = ConfigLoader::default_for(&cwd);
+    let Ok(runtime_config) = loader.load() else {
+        return;
+    };
+    let manager = build_plugin_manager(&cwd, &loader, &runtime_config);
+    if let Ok(pending) = manager.pending_sources() {
+        if !pending.is_empty() {
+            eprintln!(
+                "claw: {} new plugin(s) listed in plugins.toml — run `claw plugins sync` to build & install",
+                pending.len()
+            );
+        }
+    }
+}
+
+/// Direct `claw plugins <action> [target]` (list/add/sync/install/enable/…).
+/// One-shot: builds a manager, runs the action, prints the report.
+fn run_plugins_command(args: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    let loader = ConfigLoader::default_for(&cwd);
+    let runtime_config = loader.load()?;
+    let mut manager = build_plugin_manager(&cwd, &loader, &runtime_config);
+    let (action, target) = match args.map(str::trim).filter(|s| !s.is_empty()) {
+        None => (None, None),
+        Some(text) => {
+            let mut parts = text.splitn(2, char::is_whitespace);
+            let action = parts.next().filter(|a| !a.is_empty());
+            let target = parts.next().map(str::trim).filter(|t| !t.is_empty());
+            (action, target)
+        }
+    };
+    let result = handle_plugins_slash_command(action, target, &mut manager)?;
+    println!("{}", result.message);
+    Ok(())
+}
+
 fn build_plugin_manager(
     cwd: &Path,
     loader: &ConfigLoader,
@@ -7742,7 +7792,7 @@ mod tests {
         assert!(help.contains("/export [file]"));
         assert!(help.contains("/session [list|switch <session-id>|fork [branch-name]]"));
         assert!(help.contains(
-            "/plugin [list|install <path>|enable <name>|disable <name>|uninstall <id>|update <id>]"
+            "/plugin [list|add <git-url>|sync|install <path>|enable <name>|disable <name>|uninstall <id>|update <id>]"
         ));
         assert!(help.contains("aliases: /plugins, /marketplace"));
         assert!(help.contains("/agents"));

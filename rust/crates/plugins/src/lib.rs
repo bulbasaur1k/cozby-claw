@@ -126,6 +126,11 @@ pub struct PluginManifest {
     pub tools: Vec<PluginToolManifest>,
     #[serde(default)]
     pub commands: Vec<PluginCommandManifest>,
+    /// Shell commands run ONCE at install time, in the plugin directory, to build
+    /// its packages (e.g. `["cargo install --path ."]`). Empty → the installer
+    /// auto-detects `Cargo.toml`/`package.json` and builds accordingly.
+    #[serde(default)]
+    pub build: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -235,6 +240,8 @@ struct RawPluginManifest {
     pub tools: Vec<RawPluginToolManifest>,
     #[serde(default)]
     pub commands: Vec<PluginCommandManifest>,
+    #[serde(default)]
+    pub build: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1125,6 +1132,13 @@ impl PluginManager {
             let _ = fs::remove_dir_all(&staged_source);
         }
 
+        // Build the plugin's packages once, in its installed directory. On failure
+        // we roll back the copy so a half-built plugin is never registered.
+        if let Err(error) = run_build_step(&install_path, &manifest.build) {
+            let _ = fs::remove_dir_all(&install_path);
+            return Err(error);
+        }
+
         let now = unix_time_ms();
         let record = InstalledPluginRecord {
             kind: PluginKind::External,
@@ -1149,6 +1163,77 @@ impl PluginManager {
             version: manifest.version,
             install_path,
         })
+    }
+
+    /// Path of the declarative sources file (`<config_home>/plugins.toml`): a list
+    /// of git URLs that `sync` installs.
+    #[must_use]
+    pub fn sources_path(&self) -> PathBuf {
+        self.config.config_home.join("plugins.toml")
+    }
+
+    /// Git URLs listed in `plugins.toml` (order preserved, de-duplicated).
+    #[must_use]
+    pub fn read_sources(&self) -> Vec<String> {
+        read_plugin_sources(&self.sources_path())
+    }
+
+    /// Append a git URL to `plugins.toml` if not already present. Returns whether
+    /// it was newly added.
+    pub fn add_source(&self, url: &str) -> Result<bool, PluginError> {
+        let path = self.sources_path();
+        let mut sources = read_plugin_sources(&path);
+        if sources.iter().any(|existing| existing == url) {
+            return Ok(false);
+        }
+        sources.push(url.to_string());
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let lines = sources
+            .iter()
+            .map(|url| format!("  \"{url}\","))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let body = format!(
+            "# cozby-claw plugin sources — git URLs. `claw plugins sync` installs new ones.\nsources = [\n{lines}\n]\n"
+        );
+        fs::write(&path, body)?;
+        Ok(true)
+    }
+
+    /// Git URLs already installed (from the registry).
+    fn installed_source_urls(&self) -> Result<Vec<String>, PluginError> {
+        let registry = self.load_registry()?;
+        Ok(registry
+            .plugins
+            .values()
+            .filter_map(|record| match &record.source {
+                PluginInstallSource::GitUrl { url } => Some(url.clone()),
+                PluginInstallSource::LocalPath { .. } => None,
+            })
+            .collect())
+    }
+
+    /// Sources declared in `plugins.toml` that are not yet installed.
+    pub fn pending_sources(&self) -> Result<Vec<String>, PluginError> {
+        let installed = self.installed_source_urls()?;
+        Ok(self
+            .read_sources()
+            .into_iter()
+            .filter(|url| !installed.contains(url))
+            .collect())
+    }
+
+    /// Install every not-yet-installed source from `plugins.toml` (clone → build →
+    /// register). Returns per-URL outcomes; never aborts the batch on one failure.
+    pub fn sync(&mut self) -> Result<Vec<(String, Result<InstallOutcome, PluginError>)>, PluginError> {
+        let mut results = Vec::new();
+        for url in self.pending_sources()? {
+            let outcome = self.install(&url);
+            results.push((url, outcome));
+        }
+        Ok(results)
     }
 
     pub fn enable(&mut self, plugin_id: &str) -> Result<(), PluginError> {
@@ -1664,6 +1749,7 @@ fn build_plugin_manifest(
         lifecycle: raw.lifecycle,
         tools,
         commands,
+        build: raw.build,
     })
 }
 
@@ -2054,6 +2140,78 @@ fn run_lifecycle_commands(
     }
 
     Ok(())
+}
+
+/// Build a plugin's packages once, in `dir`. Runs the manifest `build` commands
+/// verbatim; if none are declared, auto-detects `Cargo.toml`/`package.json` and
+/// builds those. Cross-platform (sh -lc / cmd /C); build output is inherited so the
+/// user sees progress. A non-zero exit fails the install.
+fn run_build_step(dir: &Path, build: &[String]) -> Result<(), PluginError> {
+    let commands = if build.is_empty() {
+        autodetect_build(dir)
+    } else {
+        build.to_vec()
+    };
+    for command in &commands {
+        let status = shell_in(dir, command).status()?;
+        if !status.success() {
+            return Err(PluginError::CommandFailed(format!(
+                "plugin build step failed: `{command}` ({status})"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn autodetect_build(dir: &Path) -> Vec<String> {
+    let mut commands = Vec::new();
+    if dir.join("Cargo.toml").exists() {
+        commands.push("cargo build --release".to_string());
+    }
+    if dir.join("package.json").exists() {
+        commands.push("npm install".to_string());
+    }
+    commands
+}
+
+fn shell_in(dir: &Path, command: &str) -> Command {
+    let mut process = if cfg!(windows) {
+        let mut process = Command::new("cmd");
+        process.arg("/C").arg(command);
+        process
+    } else {
+        let mut process = Command::new("sh");
+        process.arg("-lc").arg(command);
+        process
+    };
+    process.current_dir(dir);
+    process
+}
+
+/// Extract git URLs from `plugins.toml`. Dependency-free: accepts both
+/// `sources = ["url", ...]` (single or multi-line) and one-URL-per-line, ignoring
+/// `#` comments. Any http(s):// or git@ token counts.
+fn read_plugin_sources(path: &Path) -> Vec<String> {
+    let Ok(text) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('#') {
+            continue;
+        }
+        for token in line.split([' ', '\t', ',', '[', ']', '=']) {
+            let token = token.trim().trim_matches(['"', '\'']);
+            let is_url = token.starts_with("http://")
+                || token.starts_with("https://")
+                || token.starts_with("git@");
+            if is_url && !out.iter().any(|existing| existing == token) {
+                out.push(token.to_string());
+            }
+        }
+    }
+    out
 }
 
 fn resolve_local_source(source: &str) -> Result<PathBuf, PluginError> {

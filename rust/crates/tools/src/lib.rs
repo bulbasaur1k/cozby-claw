@@ -3020,10 +3020,18 @@ fn resolve_skill_path(skill: &str) -> Result<std::path::PathBuf, String> {
         candidates.push(cwd.join(".claw").join("skills"));
     }
     // ~/.claw/skills — канонический пользовательский дом (наравне с providers.toml).
-    if let Some(claw_home) = std::env::var_os("CLAW_CONFIG_HOME") {
-        candidates.push(std::path::PathBuf::from(claw_home).join("skills"));
-    } else if let Ok(home) = std::env::var("HOME") {
-        candidates.push(std::path::PathBuf::from(home).join(".claw").join("skills"));
+    let claw_home = std::env::var_os("CLAW_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".claw")));
+    if let Some(claw_home) = &claw_home {
+        candidates.push(claw_home.join("skills"));
+        // Скилы установленных плагинов: ~/.claw/plugins/installed/<id>/skills.
+        let installed = claw_home.join("plugins").join("installed");
+        if let Ok(entries) = std::fs::read_dir(&installed) {
+            for entry in entries.flatten() {
+                candidates.push(entry.path().join("skills"));
+            }
+        }
     }
     if let Ok(codex_home) = std::env::var("CODEX_HOME") {
         candidates.push(std::path::PathBuf::from(codex_home).join("skills"));

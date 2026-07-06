@@ -237,7 +237,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         aliases: &["plugins", "marketplace"],
         summary: "Manage plugins",
         argument_hint: Some(
-            "[list|install <path>|enable <name>|disable <name>|uninstall <id>|update <id>]",
+            "[list|add <git-url>|sync|install <path>|enable <name>|disable <name>|uninstall <id>|update <id>]",
         ),
         resume_supported: false,
     },
@@ -1725,6 +1725,20 @@ fn parse_plugin_command(args: &[&str]) -> Result<SlashCommand, SlashCommandParse
             "plugin",
             "/plugin update <id>",
         )),
+        ["add"] => Err(usage_error("plugin add", "<git-url>")),
+        ["add", target @ ..] => Ok(SlashCommand::Plugins {
+            action: Some("add".to_string()),
+            target: Some(target.join(" ")),
+        }),
+        ["sync"] => Ok(SlashCommand::Plugins {
+            action: Some("sync".to_string()),
+            target: None,
+        }),
+        ["sync", ..] => Err(command_error(
+            "Unexpected arguments for /plugin sync.",
+            "plugin",
+            "/plugin sync",
+        )),
         [action, ..] => Err(command_error(
             &format!(
                 "Unknown /plugin action '{action}'. Use list, install <path>, enable <name>, disable <name>, uninstall <id>, or update <id>."
@@ -2223,9 +2237,52 @@ pub fn handle_plugins_slash_command(
                 reload_runtime: true,
             })
         }
+        Some("add") => {
+            let Some(url) = target else {
+                return Ok(PluginsCommandResult {
+                    message: "Usage: /plugins add <git-url>".to_string(),
+                    reload_runtime: false,
+                });
+            };
+            let added = manager.add_source(url)?;
+            let install = manager.install(url)?;
+            let note = if added { "added to plugins.toml + installed" } else { "already listed; reinstalled" };
+            Ok(PluginsCommandResult {
+                message: format!(
+                    "Plugins\n  Result           {note}\n  Source           {url}\n  Installed        {} v{}",
+                    install.plugin_id, install.version
+                ),
+                reload_runtime: true,
+            })
+        }
+        Some("sync") => {
+            let results = manager.sync()?;
+            if results.is_empty() {
+                return Ok(PluginsCommandResult {
+                    message: "Plugins\n  Result           up to date — nothing new in plugins.toml"
+                        .to_string(),
+                    reload_runtime: false,
+                });
+            }
+            let mut lines = vec!["Plugins — sync".to_string()];
+            let mut any_ok = false;
+            for (url, outcome) in &results {
+                match outcome {
+                    Ok(install) => {
+                        any_ok = true;
+                        lines.push(format!("  ✓ {} v{}  ({url})", install.plugin_id, install.version));
+                    }
+                    Err(error) => lines.push(format!("  ✗ {url} — {error}")),
+                }
+            }
+            Ok(PluginsCommandResult {
+                message: lines.join("\n"),
+                reload_runtime: any_ok,
+            })
+        }
         Some(other) => Ok(PluginsCommandResult {
             message: format!(
-                "Unknown /plugins action '{other}'. Use list, install, enable, disable, uninstall, or update."
+                "Unknown /plugins action '{other}'. Use list, install, add, sync, enable, disable, uninstall, or update."
             ),
             reload_runtime: false,
         }),
@@ -2630,6 +2687,21 @@ fn claw_config_home() -> Option<PathBuf> {
     env::var_os("HOME").map(|home| PathBuf::from(home).join(".claw"))
 }
 
+/// `skills/` directories shipped by installed plugins
+/// (`<claw_home>/plugins/installed/<id>/skills`) so plugin skills are discovered
+/// without copying them into `~/.claw/skills`.
+fn installed_plugin_skill_dirs(claw_home: &Path) -> Vec<PathBuf> {
+    let installed = claw_home.join("plugins").join("installed");
+    let Ok(entries) = fs::read_dir(&installed) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .map(|entry| entry.path().join("skills"))
+        .filter(|dir| dir.is_dir())
+        .collect()
+}
+
 fn discover_definition_roots(cwd: &Path, leaf: &str) -> Vec<(DefinitionSource, PathBuf)> {
     let mut roots = Vec::new();
 
@@ -2718,6 +2790,15 @@ fn discover_skill_roots(cwd: &Path) -> Vec<SkillRoot> {
             claw_home.join("skills"),
             SkillOrigin::SkillsDir,
         );
+        // Скилы установленных плагинов: ~/.claw/plugins/installed/<id>/skills.
+        for dir in installed_plugin_skill_dirs(&claw_home) {
+            push_unique_skill_root(
+                &mut roots,
+                DefinitionSource::UserClaw,
+                dir,
+                SkillOrigin::SkillsDir,
+            );
+        }
     }
 
     if let Ok(codex_home) = env::var("CODEX_HOME") {
@@ -4170,7 +4251,7 @@ mod tests {
         assert!(help.contains("/session [list|switch <session-id>|fork [branch-name]]"));
         assert!(help.contains("/sandbox"));
         assert!(help.contains(
-            "/plugin [list|install <path>|enable <name>|disable <name>|uninstall <id>|update <id>]"
+            "/plugin [list|add <git-url>|sync|install <path>|enable <name>|disable <name>|uninstall <id>|update <id>]"
         ));
         assert!(help.contains("aliases: /plugins, /marketplace"));
         assert!(help.contains("/agents [list|help]"));
