@@ -194,7 +194,7 @@ impl OpenAiCompatClient {
         self.http
             .post(&request_url)
             .header("content-type", "application/json")
-            .header("X-API-Key", &self.api_key)
+            .bearer_auth(&self.api_key)
             .json(&build_chat_completion_request(request, self.config()))
             .send()
             .await
