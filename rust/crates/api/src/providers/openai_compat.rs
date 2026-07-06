@@ -15,7 +15,7 @@ use crate::types::{
 
 use super::{Provider, ProviderFuture};
 
-/// Источник аутентификации для OpenAI-совместимых провайдеров.
+/// Источником аутентификации для OpenAI-совместимых провайдеров.
 /// Поддерживает различные схемы: Bearer token, API Key, кастомные заголовки.
 #[derive(Debug, Clone)]
 pub enum AuthSource {
@@ -30,52 +30,42 @@ pub enum AuthSource {
         api_key: String,
         bearer_token: String,
     },
+    /// X-Auth-Token заголовок (для custom-auth в vendor)
+    CommandToken(String),
 }
 
 impl AuthSource {
     /// Создаёт AuthSource из env-переменных для xAI
     pub fn from_env_xai() -> Result<Self, ApiError> {
         use crate::providers::anthropic::read_env_non_empty;
-        
-        if let Some(token) = read_env_non_empty("AUTH_TOKEN")? {
-            return Ok(Self::Bearer(token));
-        }
-        if let Some(token) = read_env_non_empty("reference_CLI_AUTH_TOKEN")? {
-            return Ok(Self::Bearer(token));
-        }
+
         if let Some(api_key) = read_env_non_empty("XAI_API_KEY")? {
             if api_key.starts_with("ory_at_") {
                 return Ok(Self::ApiKey(api_key));
             }
             return Ok(Self::Bearer(api_key));
         }
-        
+
         Err(ApiError::missing_credentials(
             "xAI",
-            &["XAI_API_KEY", "AUTH_TOKEN"],
+            &["XAI_API_KEY"],
         ))
     }
     
     /// Создаёт AuthSource из env-переменных для OpenAI
     pub fn from_env_openai() -> Result<Self, ApiError> {
         use crate::providers::anthropic::read_env_non_empty;
-        
-        if let Some(token) = read_env_non_empty("AUTH_TOKEN")? {
-            return Ok(Self::Bearer(token));
-        }
-        if let Some(token) = read_env_non_empty("reference_CLI_AUTH_TOKEN")? {
-            return Ok(Self::Bearer(token));
-        }
+
         if let Some(api_key) = read_env_non_empty("OPENAI_API_KEY")? {
             if api_key.starts_with("ory_at_") {
                 return Ok(Self::ApiKey(api_key));
             }
             return Ok(Self::Bearer(api_key));
         }
-        
+
         Err(ApiError::missing_credentials(
             "OpenAI",
-            &["OPENAI_API_KEY", "AUTH_TOKEN"],
+            &["OPENAI_API_KEY"],
         ))
     }
 
@@ -94,20 +84,7 @@ impl AuthSource {
             Self::ApiKeyAndBearer { api_key, bearer_token } => request_builder
                 .header("X-API-Key", api_key)
                 .bearer_auth(bearer_token),
-        }
-    }
-
-    /// Создаёт кастомные заголовки для custom-auth (как в reference CLI)
-    pub fn custom-auth(jwt: &str) -> Self {
-        let env_token = std::env::var("reference_CLI_AUTH_TOKEN").ok();
-        if env_token.as_deref() == Some(jwt) {
-            // Токен из env — используем стандартный Bearer
-            Self::Bearer(jwt.to_string())
-        } else {
-            // Кэшированный токен — используем кастомный заголовок
-            Self::CustomHeaders(BTreeMap::from([
-                ("Authorization".to_string(), format!("Bearer {}", jwt)),
-            ]))
+            Self::CommandToken(token) => request_builder.header("X-Auth-Token", token),
         }
     }
 }
@@ -485,13 +462,13 @@ impl StreamState {
         for choice in chunk.choices {
             // Reasoning-токены (Qwen3 / OpenRouter) отдаём как ThinkingDelta —
             // вне основного текстового блока, чтобы клиент показал их отдельно.
-            if let Some(reasoning) = choice.delta.reasoning.filter(|value| !value.is_empty()) {
+            if let Some(reasoning) = choice.delta.reasoning.clone().filter(|value| !value.is_empty()) {
                 events.push(StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
                     index: 0,
                     delta: ContentBlockDelta::ThinkingDelta { thinking: reasoning },
                 }));
             }
-            if let Some(content) = choice.delta.content.filter(|value| !value.is_empty()) {
+            if let Some(content) = choice.delta.content.clone().filter(|value| !value.is_empty()) {
                 if !self.text_started {
                     self.text_started = true;
                     events.push(StreamEvent::ContentBlockStart(ContentBlockStartEvent {
@@ -507,9 +484,9 @@ impl StreamState {
                 }));
             }
 
-            for tool_call in choice.delta.tool_calls {
+            for tool_call in choice.delta.tool_calls() {
                 let state = self.tool_calls.entry(tool_call.index).or_default();
-                state.apply(tool_call);
+                state.apply(tool_call.clone());
                 let block_index = state.block_index();
                 if !state.started {
                     if let Some(start_event) = state.start_event()? {
@@ -687,8 +664,14 @@ struct ChatMessage {
     role: String,
     #[serde(default)]
     content: Option<String>,
-    #[serde(default)]
-    tool_calls: Vec<ResponseToolCall>,
+    #[serde(default, rename = "tool_calls")]
+    tool_calls_raw: Option<Vec<ResponseToolCall>>,
+}
+
+impl ChatMessage {
+    fn tool_calls(&self) -> &[ResponseToolCall] {
+        self.tool_calls_raw.as_deref().unwrap_or(&[])
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -737,11 +720,17 @@ struct ChunkDelta {
     /// `ThinkingDelta` so clients can render it separately.
     #[serde(default)]
     reasoning: Option<String>,
-    #[serde(default)]
-    tool_calls: Vec<DeltaToolCall>,
+    #[serde(default, rename = "tool_calls")]
+    tool_calls_raw: Option<Vec<DeltaToolCall>>,
 }
 
-#[derive(Debug, Deserialize)]
+impl ChunkDelta {
+    fn tool_calls(&self) -> &[DeltaToolCall] {
+        self.tool_calls_raw.as_deref().unwrap_or(&[])
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
 struct DeltaToolCall {
     #[serde(default)]
     index: u32,
@@ -751,7 +740,7 @@ struct DeltaToolCall {
     function: DeltaFunction,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize)]
 struct DeltaFunction {
     #[serde(default)]
     name: Option<String>,
@@ -915,13 +904,13 @@ fn normalize_response(
             "chat completion response missing choices",
         ))?;
     let mut content = Vec::new();
-    if let Some(text) = choice.message.content.filter(|value| !value.is_empty()) {
+    if let Some(text) = choice.message.content.clone().filter(|value| !value.is_empty()) {
         content.push(OutputContentBlock::Text { text });
     }
-    for tool_call in choice.message.tool_calls {
+    for tool_call in choice.message.tool_calls() {
         content.push(OutputContentBlock::ToolUse {
-            id: tool_call.id,
-            name: tool_call.function.name,
+            id: tool_call.id.clone(),
+            name: tool_call.function.name.clone(),
             input: parse_tool_arguments(&tool_call.function.arguments),
         });
     }
@@ -929,7 +918,7 @@ fn normalize_response(
     Ok(MessageResponse {
         id: response.id,
         kind: "message".to_string(),
-        role: choice.message.role,
+        role: choice.message.role.clone(),
         content,
         model: response.model.if_empty_then(model.to_string()),
         stop_reason: choice

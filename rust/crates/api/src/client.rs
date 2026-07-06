@@ -1,35 +1,9 @@
 use crate::error::ApiError;
 use crate::prompt_cache::{PromptCache, PromptCacheRecord, PromptCacheStats};
 use crate::providers::anthropic::{self, AnthropicClient, AuthSource};
-use crate::providers::openai_compat::{self, AuthSource as OpenAiAuthSource, OpenAiCompatClient, OpenAiCompatConfig};
+use crate::providers::openai_compat::{self, OpenAiCompatClient, OpenAiCompatConfig};
 use crate::providers::{self, ProviderKind};
 use crate::types::{MessageRequest, MessageResponse, StreamEvent};
-
-/// Получает custom-auth токен из env-переменных (как в reference CLI)
-fn get_custom-auth_token() -> Option<String> {
-    std::env::var("AUTH_TOKEN")
-        .ok()
-        .filter(|t| !t.is_empty())
-        .or_else(|| {
-            std::env::var("reference_CLI_AUTH_TOKEN")
-                .ok()
-                .filter(|t| !t.is_empty())
-        })
-}
-
-/// Создаёт OpenAI-совместимый клиент с поддержкой custom-auth
-fn create_openai_client_with_custom-auth(config: OpenAiCompatConfig) -> Result<OpenAiCompatClient, ApiError> {
-    // Если есть AUTH_TOKEN — используем его как Bearer токен
-    if let Some(dp_token) = get_custom-auth_token() {
-        return Ok(OpenAiCompatClient::from_auth(
-            OpenAiAuthSource::custom-auth(&dp_token),
-            config,
-        ));
-    }
-    
-    // Иначе используем стандартную аутентификацию из env
-    OpenAiCompatClient::from_env(config)
-}
 
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
@@ -54,10 +28,10 @@ impl ProviderClient {
                 Some(auth) => AnthropicClient::from_auth(auth),
                 None => AnthropicClient::from_env()?,
             })),
-            ProviderKind::Xai => Ok(Self::Xai(create_openai_client_with_custom-auth(
+            ProviderKind::Xai => Ok(Self::Xai(OpenAiCompatClient::from_env(
                 OpenAiCompatConfig::xai(),
             )?)),
-            ProviderKind::OpenAi => Ok(Self::OpenAi(create_openai_client_with_custom-auth(
+            ProviderKind::OpenAi => Ok(Self::OpenAi(OpenAiCompatClient::from_env(
                 OpenAiCompatConfig::openai(),
             )?)),
         }

@@ -282,7 +282,11 @@ impl CliOutputFormat {
 
 #[allow(clippy::too_many_lines)]
 fn parse_args(args: &[String]) -> Result<CliAction, String> {
-    let mut model = DEFAULT_MODEL.to_string();
+    // Модель по умолчанию берётся из providers.toml, если есть
+    let mut model = ProvidersConfig::load()
+        .primary
+        .map(|slot| slot.model)
+        .unwrap_or_else(|| DEFAULT_MODEL.to_string());
     let mut output_format = CliOutputFormat::Text;
     let mut permission_mode_override = None;
     let mut wants_help = false;
@@ -5478,42 +5482,49 @@ fn effective_model(model: String) -> String {
     model
 }
 
-/// Строит клиента основной модели. Если `[primary]` в providers.toml совпадает
-/// с запрошенной моделью — используем его (OpenAI-compat либо Anthropic с ключом
-/// из файла). Иначе — нативный Anthropic с OAuth/ключом из окружения, как раньше.
+/// Строит клиента основной модели. Если `[primary]` в providers.toml задан —
+/// используем его (OpenAI-compat либо Anthropic с ключом из файла).
+/// Иначе — нативный Anthropic с OAuth/ключом из окружения, как раньше.
 fn build_primary_provider_client(
     session_id: &str,
     model: String,
 ) -> Result<(ProviderClient, String, u32), Box<dyn std::error::Error>> {
-    if let Some(slot) = ProvidersConfig::load().primary {
-        if slot.model == model {
-            match slot.kind {
-                ProviderSlotKind::Openai => {
-                    return Ok((
-                        ProviderClient::OpenAi(slot.openai_client()),
-                        slot.model,
-                        slot.max_tokens,
-                    ));
-                }
-                ProviderSlotKind::Anthropic => {
-                    let auth = if slot.api_key.trim().is_empty() {
-                        resolve_cli_auth_source()?
-                    } else {
-                        AuthSource::ApiKey(slot.api_key.clone())
-                    };
-                    let base_url = if slot.base_url.trim().is_empty() {
-                        api::read_base_url()
-                    } else {
-                        slot.base_url.clone()
-                    };
-                    let client = AnthropicClient::from_auth(auth)
-                        .with_base_url(base_url)
-                        .with_prompt_cache(PromptCache::new(session_id));
-                    return Ok((ProviderClient::Anthropic(client), slot.model, slot.max_tokens));
-                }
+    eprintln!("[DEBUG] build_primary_provider_client: model={}", model);
+    let config = ProvidersConfig::load();
+    eprintln!("[DEBUG] ProvidersConfig loaded: primary={:?}", config.primary.as_ref().map(|s| &s.model));
+    
+    if let Some(slot) = config.primary {
+        eprintln!("[DEBUG] Slot kind={:?}, model={}", slot.kind, slot.model);
+        match slot.kind {
+            ProviderSlotKind::Openai => {
+                eprintln!("[DEBUG] Using OpenAI client");
+                return Ok((
+                    ProviderClient::OpenAi(slot.openai_client()),
+                    slot.model,
+                    slot.max_tokens,
+                ));
+            }
+            ProviderSlotKind::Anthropic => {
+                eprintln!("[DEBUG] Using Anthropic client");
+                let auth = if slot.api_key.trim().is_empty() {
+                    resolve_cli_auth_source()?
+                } else {
+                    AuthSource::ApiKey(slot.api_key.clone())
+                };
+                let base_url = if slot.base_url.trim().is_empty() {
+                    api::read_base_url()
+                } else {
+                    slot.base_url.clone()
+                };
+                let client = AnthropicClient::from_auth(auth)
+                    .with_base_url(base_url)
+                    .with_prompt_cache(PromptCache::new(session_id));
+                return Ok((ProviderClient::Anthropic(client), slot.model, slot.max_tokens));
             }
         }
     }
+    eprintln!("[DEBUG] No providers.toml primary, falling back to Anthropic");
+    // Fallback на Anthropic из env
     let client = AnthropicClient::from_auth(resolve_cli_auth_source()?)
         .with_base_url(api::read_base_url())
         .with_prompt_cache(PromptCache::new(session_id));

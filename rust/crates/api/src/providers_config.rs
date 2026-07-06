@@ -11,7 +11,6 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
@@ -59,88 +58,9 @@ pub enum AuthType {
     ApiKey,
     /// Кастомные заголовки
     Custom,
-    /// custom-auth — автоматическое получение JWT через custom-auth login
-    #[serde(rename = "custom-auth")]
+    /// custom-auth (X-Auth-Token: <jwt>) — для vendor custom-auth
+    #[serde(rename = "customauth")]
     Command,
-}
-
-/// Конфигурация custom-auth для автоматического получения JWT токена
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CommandConfig {
-    /// Путь к dp binary (по умолчанию ~/.reference/dp/dp)
-    #[serde(default)]
-    pub binary_path: Option<String>,
-    /// Команда для получения токена (по умолчанию "auth login")
-    #[serde(default = "default_dp_command")]
-    pub command: String,
-    /// Путь к файлу с кэшем JWT (по умолчанию ~/.reference/custom-auth_creds.json)
-    #[serde(default)]
-    pub cache_path: Option<String>,
-}
-
-fn default_dp_command() -> String {
-    "auth login".to_string()
-}
-
-impl Default for CommandConfig {
-    fn default() -> Self {
-        Self {
-            binary_path: None,
-            command: default_dp_command(),
-            cache_path: None,
-        }
-    }
-}
-
-impl CommandConfig {
-    /// Получает JWT токен из кэша или выполняет команду для его получения
-    pub fn get_jwt_token(&self) -> Result<String, String> {
-        // Пробуем прочитать из кэша
-        let cache_path = self.cache_path.as_deref().unwrap_or("~/.reference/custom-auth_creds.json");
-        let cache_path = expand_tilde(cache_path);
-        
-        if let Ok(content) = std::fs::read_to_string(&cache_path) {
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
-                if let Some(jwt) = json.get("jwt").and_then(|v| v.as_str()) {
-                    // Проверяем, не истёк ли токен
-                    if let Some(expires_at) = json.get("expiresAt").and_then(|v| v.as_u64()) {
-                        let now = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap()
-                            .as_millis() as u64;
-                        if expires_at > now {
-                            return Ok(jwt.to_string());
-                        }
-                    }
-                }
-            }
-        }
-        
-        // Кэша нет или токен истёк — выполняем команду
-        let binary_path = self.binary_path.as_deref().unwrap_or("~/.reference/dp/dp");
-        let binary_path = expand_tilde(binary_path);
-        
-        let output = Command::new(&binary_path)
-            .args(self.command.split_whitespace())
-            .output()
-            .map_err(|e| format!("Failed to execute dp command: {}", e))?;
-        
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(format!("dp command failed: {}", stderr));
-        }
-        
-        // После выполнения команды читаем кэш
-        if let Ok(content) = std::fs::read_to_string(&cache_path) {
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
-                if let Some(jwt) = json.get("jwt").and_then(|v| v.as_str()) {
-                    return Ok(jwt.to_string());
-                }
-            }
-        }
-        
-        Err("JWT token not found after custom-auth".to_string())
-    }
 }
 
 fn expand_tilde(path: &str) -> String {
@@ -150,6 +70,178 @@ fn expand_tilde(path: &str) -> String {
         }
     }
     path.to_string()
+}
+
+/// Раскрывает переменные окружения вида `${env:VAR}` в строке.
+/// Если переменная не задана и это AUTH_TOKEN, пытается получить через `custom-auth token`.
+fn expand_env_vars(s: &str) -> String {
+    let mut result = s.to_string();
+    while let Some(start) = result.find("${env:") {
+        if let Some(end) = result[start..].find('}').map(|i| start + i) {
+            let var_name = &result[start + 6..end];
+            let var_value = get_env_or_custom-auth(var_name);
+            result.replace_range(start..=end, &var_value);
+        } else {
+            break;
+        }
+    }
+    result
+}
+
+/// Получает переменную окружения или выполняет `custom-auth token` для AUTH_TOKEN.
+/// Если есть Ory token, обменивает его на JWT через redacted API.
+fn get_env_or_custom-auth(var_name: &str) -> String {
+    // Сначала пробуем прочитать из env
+    if let Ok(value) = std::env::var(var_name) {
+        if !value.is_empty() {
+            eprintln!("[DEBUG] Using {} from env (len={})", var_name, value.len());
+            return value;
+        }
+    }
+    
+    // Если это AUTH_TOKEN или ORY_TOKEN — пробуем получить из кэша
+    if var_name == "AUTH_TOKEN" || var_name == "ORY_TOKEN" {
+        // Пробуем получить JWT из кэша reference (для AUTH_TOKEN)
+        if var_name == "AUTH_TOKEN" {
+            if let Some(jwt) = get_reference_jwt() {
+                eprintln!("[DEBUG] Using JWT from reference cache (len={})", jwt.len());
+                std::env::set_var("AUTH_TOKEN", &jwt);
+                return jwt;
+            }
+            eprintln!("[DEBUG] No reference JWT cache, trying to exchange Ory token...");
+        }
+
+        // Пробуем получить Ory токен из ~/.auth/access_token.json
+        if let Some(ory_token) = get_ory_token() {
+            eprintln!("[DEBUG] Using Ory token from cache (len={})", ory_token.len());
+            
+            // Для AUTH_TOKEN — обмениваем на JWT
+            if var_name == "AUTH_TOKEN" {
+                if let Some(jwt) = exchange_for_jwt(&ory_token) {
+                    eprintln!("[DEBUG] Exchanged Ory token for JWT (len={})", jwt.len());
+                    std::env::set_var("AUTH_TOKEN", &jwt);
+                    return jwt;
+                }
+                eprintln!("[DEBUG] Failed to exchange token, using Ory token");
+            }
+            
+            std::env::set_var(var_name, &ory_token);
+            return ory_token;
+        }
+
+        // Если нет кэша — получаем через auth-cli
+        if let Ok(output) = std::process::Command::new("auth-cli")
+            .args(["auth", "token"])
+            .output()
+        {
+            if output.status.success() {
+                let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !token.is_empty() && !token.contains("unable to load") {
+                    eprintln!("[DEBUG] Got token from auth-cli (len={})", token.len());
+                    
+                    // Для AUTH_TOKEN — обмениваем на JWT
+                    if var_name == "AUTH_TOKEN" {
+                        if let Some(jwt) = exchange_for_jwt(&token) {
+                            eprintln!("[DEBUG] Exchanged Ory token for JWT (len={})", jwt.len());
+                            std::env::set_var("AUTH_TOKEN", &jwt);
+                            return jwt;
+                        }
+                        eprintln!("[DEBUG] Failed to exchange token, using Ory token");
+                    }
+                    
+                    std::env::set_var(var_name, &token);
+                    return token;
+                }
+            }
+        }
+        eprintln!("[DEBUG] Failed to get {}", var_name);
+    }
+
+    String::new()
+}
+
+/// Пытается получить Ory access token из кэша (~/.auth/access_token.json)
+fn get_ory_token() -> Option<String> {
+    use std::path::PathBuf;
+    
+    // Пробуем ~/.auth/access_token.json (основное место хранения auth-cli)
+    let home = std::env::var("HOME").ok()?;
+    let token_path = PathBuf::from(home).join(".auth/access_token.json");
+    
+    eprintln!("[DEBUG] Looking for Ory token at {:?}", token_path);
+    let content = std::fs::read_to_string(&token_path).ok()?;
+    eprintln!("[DEBUG] Read Ory token file (len={})", content.len());
+    
+    let json: serde_json::Value = serde_json::from_str(&content).ok()?;
+    json.get("tokens")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|v| v.get("token"))
+        .and_then(|v| v.as_str())
+        .map(String::from)
+}
+
+/// Пытается получить JWT токен из кэша reference (~/.reference/custom-auth_creds.json)
+fn get_reference_jwt() -> Option<String> {
+    use std::path::PathBuf;
+    
+    let home = std::env::var("HOME").ok()?;
+    let creds_path = PathBuf::from(home).join(".reference/custom-auth_creds.json");
+    
+    eprintln!("[DEBUG] Looking for reference creds at {:?}", creds_path);
+    let content = std::fs::read_to_string(&creds_path).ok()?;
+    eprintln!("[DEBUG] Read reference creds (len={})", content.len());
+    
+    let json: serde_json::Value = serde_json::from_str(&content).ok()?;
+    
+    // Проверяем, не истёк ли токен
+    if let Some(expires_at) = json.get("expiresAt").and_then(|v| v.as_u64()) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_millis() as u64;
+        if now >= expires_at {
+            eprintln!("[WARN] reference JWT token expired (now={}, expires={})", now, expires_at);
+            return None;
+        }
+    }
+    
+    let jwt = json.get("jwt").and_then(|v| v.as_str()).map(String::from);
+    if let Some(ref t) = jwt {
+        eprintln!("[DEBUG] Found JWT in reference cache (len={})", t.len());
+    } else {
+        eprintln!("[DEBUG] No JWT field in reference creds");
+    }
+    jwt
+}
+
+/// Обменивает Ory access token на JWT через redacted API
+fn exchange_for_jwt(ory_token: &str) -> Option<String> {
+    use std::time::Duration;
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .ok()?;
+
+    let response = client
+        .post("https://internal-host.example/api/v2/token")
+        .header("Authorization", format!("Bearer {}", ory_token))
+        .send()
+        .ok()?;
+
+    if !response.status().is_success() {
+        eprintln!("[WARN] Failed to exchange token: {}", response.status());
+        return None;
+    }
+
+    let json: serde_json::Value = response.json().ok()?;
+    // Возвращаем JWT из поля "jwt" (а не "token")
+    let jwt = json.get("jwt").and_then(|v| v.as_str()).map(String::from);
+    if let Some(ref t) = jwt {
+        eprintln!("[DEBUG] Exchanged token, got JWT (len={})", t.len());
+    }
+    jwt
 }
 
 /// Один настроенный провайдер: модель + endpoint + ключ.
@@ -166,12 +258,9 @@ pub struct ProviderSlot {
     pub api_key: String,
     #[serde(default = "default_max_tokens")]
     pub max_tokens: u32,
-    /// Тип аутентификации (bearer | apikey | custom | custom-auth)
+    /// Тип аутентификации (bearer | apikey | custom)
     #[serde(default, rename = "auth_type", alias = "authType")]
     pub auth_type: AuthType,
-    /// Конфигурация custom-auth (используется при auth_type = custom-auth)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub custom-auth: Option<CommandConfig>,
     /// Кастомные заголовки аутентификации (используется при auth_type = custom)
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub custom_headers: BTreeMap<String, String>,
@@ -183,30 +272,44 @@ pub struct ProviderSlot {
 impl ProviderSlot {
     /// Строит AuthSource из конфигурации слота
     fn build_auth_source(&self) -> Result<AuthSource, String> {
+        // Раскрываем переменные окружения в api_key
+        let api_key = expand_env_vars(&self.api_key);
+        eprintln!("[DEBUG] build_auth_source: api_key len={}, starts with: {}", api_key.len(), &api_key[..api_key.len().min(30)]);
+
         match &self.auth_type {
             AuthType::Bearer => {
                 // Определяем тип токена по префиксу
-                if self.api_key.starts_with("ory_at_") {
-                    Ok(AuthSource::ApiKey(self.api_key.clone()))
+                if api_key.starts_with("ory_at_") {
+                    eprintln!("[DEBUG] Using ApiKey auth (ory token)");
+                    Ok(AuthSource::ApiKey(api_key))
                 } else {
-                    Ok(AuthSource::Bearer(self.api_key.clone()))
+                    eprintln!("[DEBUG] Using Bearer auth (JWT)");
+                    Ok(AuthSource::Bearer(api_key))
                 }
             }
-            AuthType::ApiKey => Ok(AuthSource::ApiKey(self.api_key.clone())),
+            AuthType::ApiKey => {
+                eprintln!("[DEBUG] Using ApiKey auth");
+                Ok(AuthSource::ApiKey(api_key))
+            }
             AuthType::Custom => {
                 if self.custom_headers.is_empty() {
-                    // Если кастомные заголовки не указаны, используем Bearer по умолчанию
-                    Ok(AuthSource::Bearer(self.api_key.clone()))
+                    eprintln!("[DEBUG] Using Bearer auth (custom empty)");
+                    Ok(AuthSource::Bearer(api_key))
                 } else {
-                    Ok(AuthSource::CustomHeaders(self.custom_headers.clone()))
+                    // Раскрываем переменные окружения в заголовках
+                    let headers: BTreeMap<String, String> = self.custom_headers
+                        .iter()
+                        .map(|(k, v)| (k.clone(), expand_env_vars(v)))
+                        .collect();
+                    eprintln!("[DEBUG] Using CustomHeaders auth: {:?}", headers.keys().collect::<Vec<_>>());
+                    Ok(AuthSource::CustomHeaders(headers))
                 }
             }
             AuthType::Command => {
-                // Получаем JWT токен через custom-auth
-                let default_config = CommandConfig::default();
-                let dp_config = self.custom-auth.as_ref().unwrap_or(&default_config);
-                let jwt = dp_config.get_jwt_token()?;
-                Ok(AuthSource::Bearer(jwt))
+                // Для custom-auth используем X-Auth-Token заголовок
+                // api_key содержит JWT токен (полученный автоматически или из env)
+                eprintln!("[DEBUG] Using CommandToken auth (custom-auth)");
+                Ok(AuthSource::CommandToken(api_key))
             }
         }
     }
@@ -250,7 +353,9 @@ impl ProvidersConfig {
     /// Путь к общему файлу провайдеров.
     #[must_use]
     pub fn config_path() -> PathBuf {
-        config_home().join("providers.toml")
+        let path = config_home().join("providers.toml");
+        eprintln!("[DEBUG] ProvidersConfig path: {:?}", path);
+        path
     }
 
     /// Загружает конфиг; при отсутствии файла или ошибке парсинга — пустой конфиг
@@ -258,9 +363,17 @@ impl ProvidersConfig {
     #[must_use]
     pub fn load() -> Self {
         let Ok(text) = std::fs::read_to_string(Self::config_path()) else {
+            eprintln!("[DEBUG] Failed to read providers.toml");
             return Self::default();
         };
-        toml::from_str(&text).unwrap_or_default()
+        eprintln!("[DEBUG] providers.toml content ({} bytes)", text.len());
+        match toml::from_str(&text) {
+            Ok(config) => config,
+            Err(e) => {
+                eprintln!("[DEBUG] Failed to parse providers.toml: {}", e);
+                Self::default()
+            }
+        }
     }
 
     /// Сохраняет конфиг в `~/.claw/providers.toml` (права 600 на unix).
