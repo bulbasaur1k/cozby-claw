@@ -884,6 +884,9 @@ pub struct InstallOutcome {
     pub install_path: PathBuf,
 }
 
+/// Per-source results of [`PluginManager::sync`]: `(git url, install outcome)`.
+pub type SyncOutcomes = Vec<(String, Result<InstallOutcome, PluginError>)>;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdateOutcome {
     pub plugin_id: String,
@@ -1227,7 +1230,7 @@ impl PluginManager {
 
     /// Install every not-yet-installed source from `plugins.toml` (clone → build →
     /// register). Returns per-URL outcomes; never aborts the batch on one failure.
-    pub fn sync(&mut self) -> Result<Vec<(String, Result<InstallOutcome, PluginError>)>, PluginError> {
+    pub fn sync(&mut self) -> Result<SyncOutcomes, PluginError> {
         let mut results = Vec::new();
         for url in self.pending_sources()? {
             let outcome = self.install(&url);

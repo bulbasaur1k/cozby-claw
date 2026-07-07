@@ -14,7 +14,12 @@
 #   HOOK_TOOL_INPUT  — its JSON input (contains the edited file path)
 #
 # Disable entirely with:  CLAW_VERIFY=0
-# Skip clippy/tests (check only) with:  CLAW_VERIFY_FAST=1
+# Add a full clippy sweep (slow on big workspaces) with:  CLAW_VERIFY_FULL=1
+# claw kills any hook after CLAW_HOOK_TIMEOUT_SECS (default 120s; 0 disables).
+
+# Drain the JSON payload claw pipes on stdin (we only use env vars): a hook
+# that never reads stdin would leave the parent blocked on a full pipe.
+cat >/dev/null 2>&1 || :
 
 [ "$CLAW_VERIFY" = "0" ] && exit 0
 
@@ -45,7 +50,9 @@ report() {
 # --- Rust ---------------------------------------------------------------------
 if [ "$ext" = "rs" ] && [ -f Cargo.toml ] && have cargo; then
     out=$(cargo check --quiet 2>&1) || report "cargo check" "$out"
-    if [ "$CLAW_VERIFY_FAST" != "1" ] && have cargo; then
+    # A clippy --all-targets sweep recompiles tests/benches and can take minutes
+    # per edit on a workspace, freezing the turn — opt in explicitly.
+    if [ "$CLAW_VERIFY_FULL" = "1" ] && [ "$CLAW_VERIFY_FAST" != "1" ]; then
         out=$(cargo clippy --quiet --all-targets -- -D warnings 2>&1) \
             || report "cargo clippy -D warnings" "$out"
     fi

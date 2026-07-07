@@ -65,9 +65,12 @@ Tool `Agent` запускает под-агента в отдельном пот
   `adr`, `rfc`, `mermaid`.
 - **`hooks/verify.sh` + `settings.toml`** — self-repair loop: после каждой
   правки файла запускает локальный check/lint по стеку проекта
-  (`cargo check`/`clippy` · `tsc`/`biome` · `dotnet build` · `hadolint` ·
+  (`cargo check` · `tsc`/`biome` · `dotnet build` · `hadolint` ·
   `shellcheck`) и возвращает ошибки модели как контекст. Не блокирует правку.
-  Выключить: `CLAW_VERIFY=0`; только check без clippy/тестов: `CLAW_VERIFY_FAST=1`.
+  Выключить: `CLAW_VERIFY=0`; добавить полный `cargo clippy --all-targets`
+  проход (медленно на больших workspace): `CLAW_VERIFY_FULL=1`. Любой хук
+  убивается по таймауту `CLAW_HOOK_TIMEOUT_SECS` (по умолчанию 120с, `0` — без
+  лимита) — долгий хук больше не замораживает ход.
 - **`mcp.toml`** — внешние серверы (Context7/fetch) **закомментированы**: по
   умолчанию claw не поднимает ничего с исходящим трафиком. Раскомментируй
   осознанно.

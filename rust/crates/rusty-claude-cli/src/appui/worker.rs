@@ -18,7 +18,8 @@ use api::{
 };
 use runtime::{
     load_system_prompt, ApiClient, ApiRequest, AssistantEvent, ConfigLoader, ContentBlock,
-    ConversationMessage, ConversationRuntime, MessageRole, PermissionMode, PermissionPolicy,
+    ConversationMessage, ConversationRuntime, HookAbortSignal, HookProgressEvent,
+    HookProgressReporter, MessageRole, PermissionMode, PermissionPolicy,
     PermissionPromptDecision, PermissionPrompter, PermissionRequest, RuntimeError,
     RuntimeFeatureConfig, Session, ToolError, ToolExecutor,
 };
@@ -188,7 +189,12 @@ fn worker(
         policy,
         system_prompt(&cwd),
         &feature_config,
-    );
+    )
+    // Отмена хода (Esc) должна убивать и запущенные хуки, иначе долгий
+    // PostToolUse (cargo check и т.п.) продолжает держать ход. Флаг сбрасывается
+    // в false перед каждым Prompt — сигнал взводится заново автоматически.
+    .with_hook_abort_signal(HookAbortSignal::from_flag(Arc::clone(cancel)))
+    .with_hook_progress_reporter(Box::new(GuiHookProgressReporter { tx: tx.clone() }));
     let mut prompter = GuiPermissionPrompter {
         tx: tx.clone(),
         reply_rx: perm_rx,
@@ -504,6 +510,46 @@ impl GuiToolExecutor {
             Err(_) => Err(ToolError::new("UI disconnected while awaiting an answer")),
         }
     }
+}
+
+/// Показывает в футере, какой hook сейчас выполняется — без этого пауза после
+/// правки файла (verify-хук гоняет check/lint) выглядит как зависание.
+struct GuiHookProgressReporter {
+    tx: Sender<AgentToUi>,
+}
+
+impl HookProgressReporter for GuiHookProgressReporter {
+    fn on_event(&mut self, event: &HookProgressEvent) {
+        if let HookProgressEvent::Started { command, .. } = event {
+            let _ = self.tx.send(AgentToUi::Activity(Activity::Tool {
+                label: format!("hook · {}", hook_label(command)),
+            }));
+        }
+    }
+}
+
+/// Короткая подпись hook-команды: имя скрипта, если он есть, иначе первое слово.
+fn hook_label(command: &str) -> String {
+    let tokens = command
+        .split_whitespace()
+        .map(|token| token.trim_matches(['"', '\'']))
+        .collect::<Vec<_>>();
+    let script = tokens
+        .iter()
+        .find(|token| {
+            Path::new(token)
+                .extension()
+                .is_some_and(|ext| matches!(ext.to_str(), Some("sh" | "py" | "js" | "rb")))
+        })
+        .or_else(|| tokens.first());
+    script.map_or_else(
+        || "hook".to_string(),
+        |token| {
+            Path::new(token)
+                .file_name()
+                .map_or_else(|| (*token).to_string(), |name| name.to_string_lossy().into_owned())
+        },
+    )
 }
 
 fn tool_activity_label(name: &str) -> String {

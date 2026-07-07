@@ -6,7 +6,7 @@ use std::sync::{
     Arc,
 };
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
@@ -65,6 +65,14 @@ impl HookAbortSignal {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Wraps an existing shared flag (например, флаг отмены UI), чтобы отмена
+    /// хода прерывала и хуки. Сброс флага (`store(false)`) заново «взводит»
+    /// сигнал перед следующим ходом.
+    #[must_use]
+    pub fn from_flag(aborted: Arc<AtomicBool>) -> Self {
+        Self { aborted }
     }
 
     pub fn abort(&self) {
@@ -145,6 +153,23 @@ impl HookRunResult {
     #[must_use]
     pub fn updated_input_json(&self) -> Option<&str> {
         self.updated_input()
+    }
+}
+
+/// Жёсткий потолок на одну hook-команду. Хук, не уложившийся в лимит, убивается
+/// и превращается в сообщение вместо заморозки всего хода (типичный случай —
+/// `cargo clippy` на холодном workspace или cargo, ждущий чужой build-lock).
+/// Переопределяется через `CLAW_HOOK_TIMEOUT_SECS` (0 — без лимита).
+const DEFAULT_HOOK_TIMEOUT_SECS: u64 = 120;
+
+fn hook_timeout() -> Option<Duration> {
+    match std::env::var("CLAW_HOOK_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+    {
+        Some(0) => None,
+        Some(secs) => Some(Duration::from_secs(secs)),
+        None => Some(Duration::from_secs(DEFAULT_HOOK_TIMEOUT_SECS)),
     }
 }
 
@@ -404,6 +429,24 @@ impl HookRunner {
                     result.messages.push(message);
                     return result;
                 }
+                HookCommandOutcome::TimedOut { message } => {
+                    if let Some(reporter) = reporter.as_deref_mut() {
+                        reporter.on_event(&HookProgressEvent::Cancelled {
+                            event,
+                            tool_name: tool_name.to_string(),
+                            command: command.clone(),
+                        });
+                    }
+                    result.messages.push(message);
+                    // Pre-хук мог бы запретить инструмент — раз он не ответил,
+                    // безопасный исход только «отказ». Post-хуки чисто
+                    // консультативные: их таймаут не должен превращать
+                    // успешную правку в ошибку.
+                    if event == HookEvent::PreToolUse {
+                        result.failed = true;
+                        return result;
+                    }
+                }
             }
         }
 
@@ -433,7 +476,8 @@ impl HookRunner {
             child.env("HOOK_TOOL_OUTPUT", tool_output);
         }
 
-        match child.output_with_stdin(payload.as_bytes(), abort_signal) {
+        let timeout = hook_timeout();
+        match child.output_with_stdin(payload.as_bytes(), abort_signal, timeout) {
             Ok(CommandExecution::Finished(output)) => {
                 let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
                 let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -476,6 +520,14 @@ impl HookRunner {
                     event.as_str()
                 ),
             },
+            Ok(CommandExecution::TimedOut) => HookCommandOutcome::TimedOut {
+                message: format!(
+                    "{} hook `{command}` exceeded {}s while handling `{tool_name}` and was killed; \
+                     speed the hook up or raise CLAW_HOOK_TIMEOUT_SECS (0 disables the limit)",
+                    event.as_str(),
+                    timeout.map_or(0, |limit| limit.as_secs()),
+                ),
+            },
             Err(error) => HookCommandOutcome::Failed {
                 parsed: ParsedHookOutput {
                     messages: vec![format!(
@@ -495,6 +547,7 @@ enum HookCommandOutcome {
     Deny { parsed: ParsedHookOutput },
     Failed { parsed: ParsedHookOutput },
     Cancelled { message: String },
+    TimedOut { message: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -686,30 +739,50 @@ impl CommandWithStdin {
         &mut self,
         stdin: &[u8],
         abort_signal: Option<&HookAbortSignal>,
+        timeout: Option<Duration>,
     ) -> std::io::Result<CommandExecution> {
         let mut child = self.command.spawn()?;
-        if let Some(mut child_stdin) = child.stdin.take() {
-            child_stdin.write_all(stdin)?;
-        }
+        // Payload несёт полное содержимое файла и легко превышает буфер пайпа,
+        // а хук может вообще не читать stdin — блокирующая запись здесь
+        // замораживала весь ход и не давала сработать abort-сигналу. Пишем из
+        // отдельного потока: если хук умер или не читает, поток получит EPIPE
+        // и тихо завершится.
+        let stdin_writer = child.stdin.take().map(|mut child_stdin| {
+            let payload = stdin.to_vec();
+            thread::spawn(move || {
+                let _ = child_stdin.write_all(&payload);
+            })
+        });
 
-        loop {
+        let started = Instant::now();
+        let execution = loop {
             if abort_signal.is_some_and(HookAbortSignal::is_aborted) {
                 let _ = child.kill();
                 let _ = child.wait_with_output();
-                return Ok(CommandExecution::Cancelled);
+                break CommandExecution::Cancelled;
+            }
+            if timeout.is_some_and(|limit| started.elapsed() >= limit) {
+                let _ = child.kill();
+                let _ = child.wait_with_output();
+                break CommandExecution::TimedOut;
             }
 
             match child.try_wait()? {
-                Some(_) => return child.wait_with_output().map(CommandExecution::Finished),
+                Some(_) => break child.wait_with_output().map(CommandExecution::Finished)?,
                 None => thread::sleep(Duration::from_millis(20)),
             }
+        };
+        if let Some(writer) = stdin_writer {
+            let _ = writer.join();
         }
+        Ok(execution)
     }
 }
 
 enum CommandExecution {
     Finished(std::process::Output),
     Cancelled,
+    TimedOut,
 }
 
 #[cfg(test)]
@@ -973,6 +1046,44 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn writes_large_stdin_payload_without_deadlocking_non_reading_hook() {
+        // Хук не читает stdin, а payload больше буфера пайпа (64КБ на macOS) —
+        // раньше это блокировало запись навсегда. tool_input раздувает payload.
+        let runner = HookRunner::new(RuntimeHookConfig::new(
+            Vec::new(),
+            vec![shell_snippet("printf 'post ok'")],
+            Vec::new(),
+        ));
+        let large_input = format!(r#"{{"path":"a.rs","old_string":"{}"}}"#, "x".repeat(256 * 1024));
+
+        let result = runner.run_post_tool_use("edit_file", &large_input, "done", false);
+
+        assert!(!result.is_failed());
+        assert_eq!(result.messages(), &["post ok".to_string()]);
+    }
+
+    #[test]
+    fn kills_post_hook_on_timeout_without_failing_the_tool() {
+        let runner = HookRunner::new(RuntimeHookConfig::new(
+            Vec::new(),
+            vec![shell_snippet("sleep 30")],
+            Vec::new(),
+        ));
+
+        std::env::set_var("CLAW_HOOK_TIMEOUT_SECS", "1");
+        let result = runner.run_post_tool_use("edit_file", r#"{"path":"a.rs"}"#, "done", false);
+        std::env::remove_var("CLAW_HOOK_TIMEOUT_SECS");
+
+        // Post-хук консультативный: таймаут даёт сообщение, но не ошибку.
+        assert!(!result.is_failed());
+        assert!(!result.is_denied());
+        assert!(result
+            .messages()
+            .iter()
+            .any(|message| message.contains("exceeded 1s")));
     }
 
     #[cfg(windows)]

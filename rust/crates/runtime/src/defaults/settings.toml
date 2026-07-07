@@ -6,6 +6,7 @@
 # (cargo check/clippy · tsc/biome · dotnet build · hadolint · shellcheck) и
 # возвращает найденные ошибки модели как контекст — она сама их чинит.
 # Хук НЕ блокирует правку. Полностью офлайн, ничего не уходит наружу.
-# Выключить целиком: CLAW_VERIFY=0.  Только check без clippy/тестов: CLAW_VERIFY_FAST=1.
+# Выключить целиком: CLAW_VERIFY=0.  Добавить полный clippy-проход: CLAW_VERIFY_FULL=1.
+# Любой хук убивается по таймауту CLAW_HOOK_TIMEOUT_SECS (по умолчанию 120с, 0 — без лимита).
 [hooks]
 PostToolUse = ['sh "${CLAW_CONFIG_HOME:-$HOME/.claw}/hooks/verify.sh"']
