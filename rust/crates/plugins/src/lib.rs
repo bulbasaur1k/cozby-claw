@@ -2246,6 +2246,54 @@ fn parse_install_source(source: &str) -> Result<PluginInstallSource, PluginError
     }
 }
 
+/// Clone a plugin repo. Tries ANONYMOUSLY first (credential helpers disabled, no
+/// prompt) so a public plugin is immune to broken/expired GitHub credentials on the
+/// user's machine — a common cause of spurious 401 / "invalid number of segments"
+/// from git-credential-manager. Falls back to a normal credentialed clone for
+/// private repos.
+fn clone_plugin_repo(url: &str, destination: &Path) -> Result<(), PluginError> {
+    if run_git_clone(url, destination, true).is_ok() {
+        return Ok(());
+    }
+    let _ = fs::remove_dir_all(destination); // drop any partial checkout
+    match run_git_clone(url, destination, false) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = fs::remove_dir_all(destination);
+            Err(error)
+        }
+    }
+}
+
+fn run_git_clone(url: &str, destination: &Path, anonymous: bool) -> Result<(), PluginError> {
+    let mut command = Command::new("git");
+    if anonymous {
+        // Empty credential.helper resets the whole helper chain; also drop any
+        // stale Authorization extraheader and never prompt/pop up.
+        command
+            .arg("-c")
+            .arg("credential.helper=")
+            .arg("-c")
+            .arg("http.https://github.com/.extraheader=")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GCM_INTERACTIVE", "never");
+    }
+    let output = command
+        .arg("clone")
+        .arg("--depth")
+        .arg("1")
+        .arg(url)
+        .arg(destination)
+        .output()?;
+    if !output.status.success() {
+        return Err(PluginError::CommandFailed(format!(
+            "git clone failed for `{url}`: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(())
+}
+
 fn materialize_source(
     source: &PluginInstallSource,
     temp_root: &Path,
@@ -2255,19 +2303,7 @@ fn materialize_source(
         PluginInstallSource::LocalPath { path } => Ok(path.clone()),
         PluginInstallSource::GitUrl { url } => {
             let destination = temp_root.join(format!("plugin-{}", unix_time_ms()));
-            let output = Command::new("git")
-                .arg("clone")
-                .arg("--depth")
-                .arg("1")
-                .arg(url)
-                .arg(&destination)
-                .output()?;
-            if !output.status.success() {
-                return Err(PluginError::CommandFailed(format!(
-                    "git clone failed for `{url}`: {}",
-                    String::from_utf8_lossy(&output.stderr).trim()
-                )));
-            }
+            clone_plugin_repo(url, &destination)?;
             Ok(destination)
         }
     }
