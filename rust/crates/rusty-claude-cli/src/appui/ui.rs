@@ -12,7 +12,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
 use crossterm::execute;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -54,6 +54,18 @@ enum Role {
 struct Entry {
     role: Role,
     text: String,
+    /// Язык для подсветки синтаксиса (только `Role::Diff`) — расширение файла.
+    lang: Option<String>,
+}
+
+impl Entry {
+    fn new(role: Role, text: String) -> Self {
+        Self {
+            role,
+            text,
+            lang: None,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -143,6 +155,9 @@ struct Tab {
     save_path: Option<PathBuf>,
     model: String,
     mode: PermissionMode,
+    /// Уже была запрошена мягкая отмена этого хода — повтор эскалирует в
+    /// принудительный обрыв (перезапуск воркера) на случай реального зависания.
+    cancel_requested: bool,
 }
 
 impl Tab {
@@ -182,11 +197,21 @@ impl Tab {
             save_path,
             model: model.to_string(),
             mode,
+            cancel_requested: false,
         }
     }
 
     fn push(&mut self, role: Role, text: String) {
-        self.entries.push(Entry { role, text });
+        self.entries.push(Entry::new(role, text));
+    }
+
+    /// Diff-превью правки: текст с префиксами `+`/`-` плюс язык файла для подсветки.
+    fn push_diff(&mut self, text: String, lang: Option<String>) {
+        self.entries.push(Entry {
+            role: Role::Diff,
+            text,
+            lang,
+        });
     }
 
     fn append_stream(&mut self, role: Role, text: &str) {
@@ -207,8 +232,9 @@ impl Tab {
             AgentToUi::ToolCall { name, input } => {
                 if let Some(diff) = build_edit_diff(&name, &input) {
                     let path = edit_path(&input).unwrap_or_default();
+                    let lang = lang_from_path(&path);
                     self.push(Role::Tool, format!("{name}  {path}"));
-                    self.push(Role::Diff, diff);
+                    self.push_diff(diff, lang);
                 } else {
                     self.push(Role::Tool, format!("{name}  {}", first_line(&input, 200)));
                 }
@@ -241,6 +267,7 @@ impl Tab {
             AgentToUi::Activity(activity) => self.activity = activity,
             AgentToUi::TurnDone => {
                 self.running = false;
+                self.cancel_requested = false;
                 self.activity = Activity::Idle;
                 self.turn_start = None;
                 self.handle.cancel.store(false, Ordering::SeqCst);
@@ -248,6 +275,7 @@ impl Tab {
             AgentToUi::Error(error) => {
                 self.push(Role::Error, error);
                 self.running = false;
+                self.cancel_requested = false;
                 self.activity = Activity::Idle;
                 self.turn_start = None;
                 self.handle.cancel.store(false, Ordering::SeqCst);
@@ -255,6 +283,17 @@ impl Tab {
         }
     }
 
+}
+
+/// Область ссылки в отрендеренной истории: индекс строки + диапазон колонок → URL.
+/// По ней клик мышью (mouse capture) открывает ссылку системным `open`/`xdg-open`,
+/// поэтому кликается сам ярлык `[текст]`, а не показанный URL — как в браузере.
+#[derive(Debug, Clone)]
+struct LinkRegion {
+    line: usize,
+    start: usize,
+    end: usize,
+    url: String,
 }
 
 struct App {
@@ -279,6 +318,12 @@ struct App {
     vim_pending: Option<char>,
     /// Куда направлен фокус клавиатуры: основная область или меню сессий.
     focus: Focus,
+    /// Прямоугольник области истории — для маппинга клика мыши в строку/колонку.
+    history_area: Rect,
+    /// Вертикальный scroll-offset истории на последней отрисовке.
+    history_offset: u16,
+    /// Ссылки активной вкладки в координатах отрендеренных строк (для клика).
+    link_regions: Vec<LinkRegion>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -346,6 +391,9 @@ impl App {
             vim_mode: VimMode::Insert,
             vim_pending: None,
             focus: Focus::Main,
+            history_area: Rect::default(),
+            history_offset: 0,
+            link_regions: Vec::new(),
         };
         if app.active().entries.is_empty() {
             app.active_mut().push(Role::System, keymap_text());
@@ -393,7 +441,12 @@ impl App {
                     Event::Mouse(mouse) => match mouse.kind {
                         MouseEventKind::ScrollUp => self.scroll_history(3),
                         MouseEventKind::ScrollDown => self.scroll_history(-3),
-                        // move/drag/click событий много — не перерисовываемся зря
+                        MouseEventKind::Down(MouseButton::Left) => {
+                            // Клик по ссылке открывает её в браузере; UI не меняется.
+                            self.open_link_at(mouse.column, mouse.row);
+                            continue;
+                        }
+                        // move/drag/прочие клики — не перерисовываемся зря
                         _ => continue,
                     },
                     Event::Resize(_, _) => {}
@@ -453,6 +506,34 @@ impl App {
         } else {
             s.saturating_sub(delta.unsigned_abs())
         };
+    }
+
+    /// Открывает ссылку под курсором (экранные `col`/`row`) в браузере, если клик
+    /// попал в её область. Координаты мапятся в строку/колонку истории через
+    /// сохранённые `history_area`/`history_offset`. Возвращает `true`, если открыл.
+    fn open_link_at(&self, col: u16, row: u16) -> bool {
+        let area = self.history_area;
+        if area.width < 3
+            || area.height < 3
+            || col <= area.x
+            || row <= area.y
+            || col >= area.x + area.width - 1
+            || row >= area.y + area.height - 1
+        {
+            return false;
+        }
+        let content_col = (col - area.x - 1) as usize;
+        let content_row = (row - area.y - 1) as usize;
+        let line = self.history_offset as usize + content_row;
+        if let Some(region) = self
+            .link_regions
+            .iter()
+            .find(|r| r.line == line && content_col >= r.start && content_col < r.end)
+        {
+            open_url(&region.url);
+            return true;
+        }
+        false
     }
 
     // --- клавиши ------------------------------------------------------------
@@ -664,6 +745,7 @@ impl App {
         let handle_tx = self.active().handle.to_agent.clone();
         let tab = self.active_mut();
         tab.running = true;
+        tab.cancel_requested = false;
         tab.activity = Activity::Model;
         tab.turn_start = Some(Instant::now());
         let _ = handle_tx.send(UiToAgent::Prompt(text));
@@ -850,6 +932,7 @@ impl App {
         let handle_tx = self.active().handle.to_agent.clone();
         let tab = self.active_mut();
         tab.running = true;
+        tab.cancel_requested = false;
         tab.activity = Activity::Model;
         tab.turn_start = Some(Instant::now());
         let _ = handle_tx.send(UiToAgent::Prompt(prompt));
@@ -1156,9 +1239,50 @@ impl App {
     }
 
     fn cancel_turn(&mut self) {
+        if !self.active().running {
+            return;
+        }
+        // Первый Esc/Ctrl+C — мягкая (кооперативная) отмена. Повторный, пока ход
+        // всё ещё идёт, — жёсткий обрыв: отбрасываем зависший воркер целиком.
+        if self.active().cancel_requested {
+            self.force_abort_turn();
+            return;
+        }
         self.active().handle.cancel.store(true, Ordering::SeqCst);
-        self.active_mut()
-            .push(Role::System, "⏹ отмена хода…".to_string());
+        let tab = self.active_mut();
+        tab.cancel_requested = true;
+        tab.push(
+            Role::System,
+            "⏹ отмена хода… (ещё раз Esc/Ctrl+C — оборвать принудительно)".to_string(),
+        );
+    }
+
+    /// Жёсткая отмена зависшего хода: кооперативный `cancel` может не сработать,
+    /// если тул или сетевое чтение заблокировались внутри (их никто не прерывает).
+    /// Поднимаем СВЕЖИЙ воркер из последней сохранённой сессии и подменяем хендл —
+    /// старый поток осиротеет (его канал закроется) и завершится сам, когда/если
+    /// разблокируется. UI сразу возвращается в рабочее состояние.
+    fn force_abort_turn(&mut self) {
+        let model = self.active().model.clone();
+        let mode = self.active().mode;
+        let save_path = self.active().save_path.clone();
+        let session = save_path
+            .as_deref()
+            .and_then(|path| Session::load_from_path(path).ok())
+            .unwrap_or_else(Session::new);
+        // Просим старый воркер завершиться, если он когда-нибудь очнётся.
+        self.active().handle.cancel.store(true, Ordering::SeqCst);
+        let handle = worker::spawn_agent(model, mode, session, save_path);
+        let tab = self.active_mut();
+        tab.handle = handle; // drop старого хендла → его каналы закрываются
+        tab.running = false;
+        tab.cancel_requested = false;
+        tab.activity = Activity::Idle;
+        tab.turn_start = None;
+        tab.push(
+            Role::System,
+            "⏹ ход оборван принудительно — воркер перезапущен из сохранённой сессии".to_string(),
+        );
     }
 
     // --- автодополнение -----------------------------------------------------
@@ -1317,13 +1441,17 @@ impl App {
     fn draw_history(&mut self, frame: &mut Frame, area: Rect) {
         let theme = self.theme;
         let width = area.width.saturating_sub(2).max(1) as usize;
-        let lines = self.history_lines(width);
+        let (lines, regions) = self.history_lines(width);
         let viewport = area.height.saturating_sub(2);
         let total = u16::try_from(lines.len()).unwrap_or(u16::MAX);
         let max_scroll = total.saturating_sub(viewport);
         let scroll_back = self.active().scroll_back.min(max_scroll);
         self.active_mut().scroll_back = scroll_back;
         let offset = max_scroll.saturating_sub(scroll_back);
+        // Сохраняем геометрию и карту ссылок — чтобы открыть ссылку по клику мышью.
+        self.history_area = area;
+        self.history_offset = offset;
+        self.link_regions = regions;
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(theme.muted))
@@ -1339,17 +1467,18 @@ impl App {
         );
     }
 
-    fn history_lines(&self, width: usize) -> Vec<Line<'static>> {
+    fn history_lines(&self, width: usize) -> (Vec<Line<'static>>, Vec<LinkRegion>) {
         let theme = self.theme;
         let mut lines = Vec::new();
+        let mut regions = Vec::new();
         for entry in &self.active().entries {
             if entry.role == Role::Assistant {
-                self.push_markdown(&mut lines, &entry.text, width);
+                self.push_markdown(&mut lines, &mut regions, &entry.text, width);
                 lines.push(Line::from(""));
                 continue;
             }
             if entry.role == Role::Diff {
-                self.push_code_block(&mut lines, &entry.text, "diff", width);
+                self.push_edit_diff(&mut lines, &entry.text, entry.lang.as_deref(), width);
                 continue;
             }
             let (prefix, color, dim) = match entry.role {
@@ -1377,22 +1506,24 @@ impl App {
                 lines.push(Line::from(""));
             }
         }
-        lines
+        (lines, regions)
     }
 
     /// Рендер markdown-ответа ассистента в ratatui-строки: заголовки, **жирный**,
     /// *курсив*, `инлайн-код`, списки, цитаты, правила и переносы — через
     /// pulldown-cmark; блоки кода ```…``` — подсветка синтаксиса (syntect) моно-
     /// панелью. Абзацы переносятся по ширине.
-    fn push_markdown(&self, lines: &mut Vec<Line<'static>>, text: &str, width: usize) {
+    fn push_markdown(
+        &self,
+        lines: &mut Vec<Line<'static>>,
+        regions: &mut Vec<LinkRegion>,
+        text: &str,
+        width: usize,
+    ) {
         let mut md = MdBuilder::new(self.theme, width);
         let mut in_code = false;
         let mut code_lang = String::new();
         let mut code_buf = String::new();
-        // Текущая ссылка: URL и накопленный видимый текст (для сравнения, чтобы не
-        // печатать `url (url)` для «голых» автоссылок).
-        let mut link_url: Option<String> = None;
-        let mut link_text = String::new();
         for event in Parser::new_ext(text, Options::all()) {
             match event {
                 MdEvent::Start(Tag::CodeBlock(kind)) => {
@@ -1410,12 +1541,7 @@ impl App {
                     lines.push(Line::from(""));
                 }
                 MdEvent::Text(t) if in_code => code_buf.push_str(&t),
-                MdEvent::Text(t) => {
-                    if link_url.is_some() {
-                        link_text.push_str(&t);
-                    }
-                    md.text(lines, &t);
-                }
+                MdEvent::Text(t) => md.text(lines, &t),
                 MdEvent::Code(c) => md.inline_code(lines, &c),
                 MdEvent::Start(Tag::Strong) => md.strong += 1,
                 MdEvent::End(TagEnd::Strong) => md.strong = md.strong.saturating_sub(1),
@@ -1423,20 +1549,11 @@ impl App {
                 MdEvent::End(TagEnd::Emphasis) => md.emphasis = md.emphasis.saturating_sub(1),
                 MdEvent::Start(Tag::Link { dest_url, .. }) => {
                     md.link += 1;
-                    link_url = Some(dest_url.to_string());
-                    link_text.clear();
+                    md.cur_link = Some(dest_url.to_string());
                 }
                 MdEvent::End(TagEnd::Link) => {
-                    // ratatui не умеет OSC 8, поэтому печатаем сам URL рядом с
-                    // текстом — его видно и можно открыть Cmd/Ctrl+кликом в
-                    // терминалах с автолинковкой. md.link ещё > 0 → URL идёт
-                    // тем же link-стилем.
-                    if let Some(url) = link_url.take() {
-                        if !url.is_empty() && link_text.trim() != url.trim() {
-                            md.text(lines, &format!(" ({url})"));
-                        }
-                    }
                     md.link = md.link.saturating_sub(1);
+                    md.cur_link = None;
                 }
                 MdEvent::Start(Tag::Heading { level, .. }) => {
                     md.flush(lines);
@@ -1479,6 +1596,7 @@ impl App {
             self.push_code_block(lines, code_buf.trim_end_matches('\n'), &code_lang, width);
         }
         md.flush(lines);
+        regions.append(&mut md.link_regions);
     }
 
     /// Добавляет подсвеченный блок кода (через кэш) в моно-панель.
@@ -1497,6 +1615,38 @@ impl App {
         {
             let mut cache = self.hl_cache.borrow_mut();
             // Стриминг плодит временные ключи (растущий блок) — ограничиваем рост.
+            if cache.len() > 1024 {
+                cache.clear();
+            }
+            cache.insert(key, block.clone());
+        }
+        lines.extend(block);
+    }
+
+    /// Рендерит diff-превью правки: код подсвечен синтаксисом языка файла, а
+    /// add/remove показаны фоном строки и маркером в жёлобе (не сплошной заливкой).
+    /// Кэшируется так же, как блоки кода (отдельный неймспейс ключа).
+    fn push_edit_diff(
+        &self,
+        lines: &mut Vec<Line<'static>>,
+        diff: &str,
+        lang: Option<&str>,
+        width: usize,
+    ) {
+        let lang = lang.unwrap_or("");
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        "edit-diff".hash(&mut hasher);
+        lang.hash(&mut hasher);
+        diff.hash(&mut hasher);
+        width.hash(&mut hasher);
+        let key = hasher.finish();
+        if let Some(cached) = self.hl_cache.borrow().get(&key) {
+            lines.extend(cached.iter().cloned());
+            return;
+        }
+        let block = highlight::highlight_diff(diff, lang, width);
+        {
+            let mut cache = self.hl_cache.borrow_mut();
             if cache.len() > 1024 {
                 cache.clear();
             }
@@ -1772,27 +1922,23 @@ fn rebuild_entries(session: &Session) -> Vec<Entry> {
                         continue;
                     }
                     match message.role {
-                        MessageRole::User => out.push(Entry {
-                            role: Role::User,
-                            text: text.clone(),
-                        }),
-                        MessageRole::Assistant => out.push(Entry {
-                            role: Role::Assistant,
-                            text: text.clone(),
-                        }),
+                        MessageRole::User => out.push(Entry::new(Role::User, text.clone())),
+                        MessageRole::Assistant => {
+                            out.push(Entry::new(Role::Assistant, text.clone()));
+                        }
                         MessageRole::System | MessageRole::Tool => {}
                     }
                 }
-                ContentBlock::ToolUse { name, input, .. } => out.push(Entry {
-                    role: Role::Tool,
-                    text: format!("{name}  {}", first_line(input, 200)),
-                }),
+                ContentBlock::ToolUse { name, input, .. } => out.push(Entry::new(
+                    Role::Tool,
+                    format!("{name}  {}", first_line(input, 200)),
+                )),
                 ContentBlock::ToolResult {
                     output, is_error, ..
-                } => out.push(Entry {
-                    role: if *is_error { Role::Error } else { Role::ToolResult },
-                    text: format!("⎿ {}", first_line(output, 400)),
-                }),
+                } => out.push(Entry::new(
+                    if *is_error { Role::Error } else { Role::ToolResult },
+                    format!("⎿ {}", first_line(output, 400)),
+                )),
             }
         }
     }
@@ -1895,6 +2041,14 @@ fn edit_path(input: &str) -> Option<String> {
     value.get("path")?.as_str().map(str::to_string)
 }
 
+/// Язык подсветки по расширению файла (`src/x.rs` → `rs`); `None`, если расширения нет.
+fn lang_from_path(path: &str) -> Option<String> {
+    std::path::Path::new(path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(str::to_ascii_lowercase)
+}
+
 /// Текст промпта для prompt-макроса. Ссылается на соответствующий прозрачный
 /// скил (~/.claw/skills), поэтому процедура редактируется без пересборки.
 fn macro_prompt(kind: &str, args: Option<&str>) -> String {
@@ -1931,6 +2085,12 @@ struct MdBuilder {
     quote: u32,
     list: Vec<Option<u64>>,
     item_prefix: Option<String>,
+    /// URL текущей ссылки (между Start/End Tag::Link) — для записи её областей.
+    cur_link: Option<String>,
+    /// Области ссылки на ТЕКУЩЕЙ (ещё не сброшенной) строке: (col_start, col_end, url).
+    pending_links: Vec<(usize, usize, String)>,
+    /// Готовые области ссылок в координатах итогового `lines` (индекс строки абсолютный).
+    link_regions: Vec<LinkRegion>,
 }
 
 impl MdBuilder {
@@ -1948,6 +2108,9 @@ impl MdBuilder {
             quote: 0,
             list: Vec::new(),
             item_prefix: None,
+            cur_link: None,
+            pending_links: Vec::new(),
+            link_regions: Vec::new(),
         }
     }
 
@@ -2004,6 +2167,13 @@ impl MdBuilder {
         }
         self.col += word_w;
         self.cur.push(Span::styled(word.to_string(), style));
+        // Запоминаем область слова, если оно внутри ссылки — для клика мышью.
+        if self.link > 0 {
+            if let Some(url) = &self.cur_link {
+                self.pending_links
+                    .push((self.col - word_w, self.col, url.clone()));
+            }
+        }
     }
 
     fn text(&mut self, lines: &mut Vec<Line<'static>>, text: &str) {
@@ -2034,12 +2204,34 @@ impl MdBuilder {
     }
 
     fn flush(&mut self, lines: &mut Vec<Line<'static>>) {
-        if !self.cur.is_empty() {
+        if self.cur.is_empty() {
+            // Строки не будет — сбрасываем накопленные области, чтобы не сместить индексы.
+            self.pending_links.clear();
+        } else {
+            let line = lines.len();
+            for (start, end, url) in self.pending_links.drain(..) {
+                self.link_regions.push(LinkRegion { line, start, end, url });
+            }
             lines.push(Line::from(std::mem::take(&mut self.cur)));
         }
         self.col = 0;
         self.prefix_w = 0;
     }
+}
+
+/// Открывает URL системным обработчиком (`open` на macOS, `xdg-open` на Linux).
+/// Fire-and-forget: вывод глушим, ошибки игнорируем.
+fn open_url(url: &str) {
+    let program = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    let _ = std::process::Command::new(program)
+        .arg(url)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
 }
 
 fn heading_rank(level: HeadingLevel) -> u8 {
@@ -2216,6 +2408,26 @@ mod tests {
     use ratatui::style::Modifier;
     use ratatui::text::Line;
     use runtime::PermissionMode;
+
+    #[test]
+    fn markdown_records_link_region_for_click_hit_testing() {
+        let mut builder = MdBuilder::new(THEMES[0], 40);
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        builder.text(&mut lines, "See");
+        builder.link = 1;
+        builder.cur_link = Some("https://example.com".to_string());
+        builder.text(&mut lines, "docs");
+        builder.link = 0;
+        builder.cur_link = None;
+        builder.flush(&mut lines);
+
+        assert_eq!(builder.link_regions.len(), 1, "one link region recorded");
+        let region = &builder.link_regions[0];
+        assert_eq!(region.url, "https://example.com");
+        assert_eq!(region.line, 0);
+        // «See docs» → «docs» занимает колонки 4..8, только их и должно ловить.
+        assert_eq!((region.start, region.end), (4, 8));
+    }
 
     #[test]
     fn markdown_wraps_long_text_and_keeps_bold() {

@@ -7,7 +7,7 @@
 
 use std::sync::OnceLock;
 
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{Theme, ThemeSet};
@@ -54,6 +54,67 @@ pub fn highlight_block(code: &str, lang: &str, bg: Color, width: usize) -> Vec<L
     out
 }
 
+/// Подсвечивает diff (строки с префиксами `+`/`-`/пробел) синтаксисом языка
+/// `lang`, **сохраняя цвета кода**. Add/remove показываются мягким фоном строки
+/// и маркером в жёлобе, а не сплошной красно-зелёной заливкой (стиль git-delta).
+/// Строки без префикса (напр. сводка «… ещё N строк») идут приглушённым текстом.
+#[must_use]
+pub fn highlight_diff(diff: &str, lang: &str, width: usize) -> Vec<Line<'static>> {
+    let assets = assets();
+    let syntax = find_syntax(assets, lang);
+    let mut highlighter = HighlightLines::new(syntax, &assets.theme);
+
+    let bg_ctx = Color::Rgb(30, 33, 44);
+    let bg_add = Color::Rgb(26, 44, 33);
+    let bg_del = Color::Rgb(50, 30, 34);
+    let fg_add = Color::Rgb(126, 199, 130);
+    let fg_del = Color::Rgb(224, 130, 140);
+    let fg_muted = Color::Rgb(127, 132, 156);
+
+    let code_w = width.saturating_sub(2).max(1); // 2 колонки под жёлоб «± »
+    let mut out = Vec::new();
+
+    for raw in diff.lines() {
+        let (marker, bg, gutter_fg, content, do_highlight) = match raw.chars().next() {
+            Some('+') => ('+', bg_add, fg_add, &raw[1..], true),
+            Some('-') => ('-', bg_del, fg_del, &raw[1..], true),
+            Some(' ') => (' ', bg_ctx, fg_muted, &raw[1..], true),
+            _ => (' ', bg_ctx, fg_muted, raw, false),
+        };
+
+        let mut spans = vec![Span::styled(
+            format!("{marker} "),
+            Style::default()
+                .fg(gutter_fg)
+                .bg(bg)
+                .add_modifier(Modifier::BOLD),
+        )];
+
+        if do_highlight {
+            let ranges = highlighter
+                .highlight_line(content, &assets.syntaxes)
+                .unwrap_or_default();
+            spans.extend(styled_spans(&ranges, bg, code_w));
+        } else {
+            let text: String = content.chars().take(code_w).collect();
+            let used = text.chars().count();
+            spans.push(Span::styled(text, Style::default().fg(fg_muted).bg(bg)));
+            if used < code_w {
+                spans.push(Span::styled(" ".repeat(code_w - used), Style::default().bg(bg)));
+            }
+        }
+        out.push(Line::from(spans));
+    }
+
+    if out.is_empty() {
+        out.push(Line::from(Span::styled(
+            " ".repeat(width),
+            Style::default().bg(bg_ctx),
+        )));
+    }
+    out
+}
+
 fn find_syntax<'a>(assets: &'a Assets, lang: &str) -> &'a SyntaxReference {
     let lang = lang.trim();
     if !lang.is_empty() {
@@ -75,18 +136,27 @@ fn styled_line(
     bg: Color,
     width: usize,
 ) -> Line<'static> {
-    let cap = width.saturating_sub(1);
+    Line::from(styled_spans(ranges, bg, width))
+}
+
+/// Строит подсвеченные спаны из диапазонов syntect, обрезая по `width` и добивая
+/// фоном до правого края. Общее для блоков кода и строк diff.
+fn styled_spans(
+    ranges: &[(syntect::highlighting::Style, &str)],
+    bg: Color,
+    width: usize,
+) -> Vec<Span<'static>> {
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut used = 0usize;
     for (style, text) in ranges {
-        if used >= cap {
+        if used >= width {
             break;
         }
         let text = text.trim_end_matches(['\n', '\r']);
         if text.is_empty() {
             continue;
         }
-        let slice: String = text.chars().take(cap - used).collect();
+        let slice: String = text.chars().take(width - used).collect();
         let count = slice.chars().count();
         if count == 0 {
             continue;
@@ -105,7 +175,7 @@ fn styled_line(
             Style::default().bg(bg),
         ));
     }
-    Line::from(spans)
+    spans
 }
 
 #[cfg(test)]
@@ -122,6 +192,21 @@ mod tests {
         assert!(
             lines[0].spans.len() >= 2,
             "syntax should split the line into colored spans"
+        );
+    }
+
+    #[test]
+    fn diff_keeps_syntax_colors_and_marks_add_remove() {
+        let diff = "-let x = 1;\n+let x = 2;\n";
+        let lines = super::highlight_diff(diff, "rust", 40);
+        assert_eq!(lines.len(), 2, "one ratatui line per diff line");
+        // Жёлоб несёт маркер +/- (а не сплошную заливку всей строки).
+        assert!(lines[0].spans[0].content.starts_with('-'), "remove marker");
+        assert!(lines[1].spans[0].content.starts_with('+'), "add marker");
+        // Подсветка кода сохраняется: строка бьётся на несколько цветовых спанов.
+        assert!(
+            lines[0].spans.len() >= 3,
+            "syntax highlighting preserved inside the diff line"
         );
     }
 
