@@ -11,7 +11,8 @@
 #
 # Wired as a PostToolUse hook (see ~/.claw/settings.toml). Env provided by claw:
 #   HOOK_TOOL_NAME   — the tool that just ran
-#   HOOK_TOOL_INPUT  — its JSON input (contains the edited file path)
+#   HOOK_FILE_PATH   — the edited file path (pre-extracted by claw)
+#   HOOK_TOOL_INPUT  — its JSON input, truncated to 32KB (full JSON on stdin)
 #
 # Disable entirely with:  CLAW_VERIFY=0
 # Add a full clippy sweep (slow on big workspaces) with:  CLAW_VERIFY_FULL=1
@@ -29,10 +30,14 @@ case "$HOOK_TOOL_NAME" in
     *) exit 0 ;;
 esac
 
-# Best-effort: pull the edited file path out of the tool input JSON.
-path=$(printf '%s' "$HOOK_TOOL_INPUT" \
-    | grep -oE '"(file_path|path)"[[:space:]]*:[[:space:]]*"[^"]+"' \
-    | head -1 | sed -E 's/.*"([^"]+)"$/\1/')
+# Edited file path: prefer the pre-extracted env var; fall back to grepping the
+# (possibly truncated) tool input JSON for older claw binaries.
+path=$HOOK_FILE_PATH
+if [ -z "$path" ]; then
+    path=$(printf '%s' "$HOOK_TOOL_INPUT" \
+        | grep -oE '"(file_path|path)"[[:space:]]*:[[:space:]]*"[^"]+"' \
+        | head -1 | sed -E 's/.*"([^"]+)"$/\1/')
+fi
 ext=${path##*.}
 base=$(basename "$path" 2>/dev/null)
 

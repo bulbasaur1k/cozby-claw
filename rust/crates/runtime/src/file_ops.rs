@@ -89,7 +89,10 @@ pub struct WriteFileOutput {
     pub content: String,
     #[serde(rename = "structuredPatch")]
     pub structured_patch: Vec<StructuredPatchHunk>,
-    #[serde(rename = "originalFile")]
+    /// Прежнее содержимое остаётся в памяти для вызывающего кода, но в tool
+    /// result не сериализуется: модель его уже видела, а на больших файлах
+    /// этот дубль раздувал результат до мегабайт.
+    #[serde(rename = "originalFile", default, skip_serializing)]
     pub original_file: Option<String>,
     #[serde(rename = "gitDiff")]
     pub git_diff: Option<serde_json::Value>,
@@ -104,7 +107,8 @@ pub struct EditFileOutput {
     pub old_string: String,
     #[serde(rename = "newString")]
     pub new_string: String,
-    #[serde(rename = "originalFile")]
+    /// См. [`WriteFileOutput::original_file`] — не сериализуется в tool result.
+    #[serde(rename = "originalFile", default, skip_serializing)]
     pub original_file: String,
     #[serde(rename = "structuredPatch")]
     pub structured_patch: Vec<StructuredPatchHunk>,
@@ -507,20 +511,58 @@ fn apply_limit<T>(
     )
 }
 
+/// Потолок на размер patch-хунка. Раньше `make_patch` выдавал ВЕСЬ старый файл
+/// как `-строки` плюс ВЕСЬ новый как `+строки` — tool result правки большого
+/// файла раздувался до мегабайт, ронял спавн хуков (E2BIG на env) и топил
+/// модель контекстом. Всё сверх потолка сворачивается в маркер-строку.
+const MAX_PATCH_LINES: usize = 200;
+
 fn make_patch(original: &str, updated: &str) -> Vec<StructuredPatchHunk> {
-    let mut lines = Vec::new();
-    for line in original.lines() {
-        lines.push(format!("-{line}"));
-    }
-    for line in updated.lines() {
-        lines.push(format!("+{line}"));
+    let old_lines: Vec<&str> = original.lines().collect();
+    let new_lines: Vec<&str> = updated.lines().collect();
+
+    // Минимальный хунк: общие префикс и суффикс не входят в дифф.
+    let prefix = old_lines
+        .iter()
+        .zip(new_lines.iter())
+        .take_while(|(old, new)| old == new)
+        .count();
+    let max_suffix = old_lines.len().min(new_lines.len()) - prefix;
+    let suffix = old_lines
+        .iter()
+        .rev()
+        .zip(new_lines.iter().rev())
+        .take_while(|(old, new)| old == new)
+        .take(max_suffix)
+        .count();
+
+    let removed = &old_lines[prefix..old_lines.len() - suffix];
+    let added = &new_lines[prefix..new_lines.len() - suffix];
+    if removed.is_empty() && added.is_empty() {
+        return Vec::new();
     }
 
+    let mut lines = Vec::new();
+    let mut push_side = |marker: char, side: &[&str]| {
+        let budget = MAX_PATCH_LINES / 2;
+        for line in side.iter().take(budget) {
+            lines.push(format!("{marker}{line}"));
+        }
+        if side.len() > budget {
+            lines.push(format!(
+                "{marker}… [{} more line(s) truncated]",
+                side.len() - budget
+            ));
+        }
+    };
+    push_side('-', removed);
+    push_side('+', added);
+
     vec![StructuredPatchHunk {
-        old_start: 1,
-        old_lines: original.lines().count(),
-        new_start: 1,
-        new_lines: updated.lines().count(),
+        old_start: prefix + 1,
+        old_lines: removed.len(),
+        new_start: prefix + 1,
+        new_lines: added.len(),
         lines,
     }]
 }

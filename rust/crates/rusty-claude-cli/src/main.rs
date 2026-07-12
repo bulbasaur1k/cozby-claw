@@ -775,7 +775,7 @@ fn filter_tool_specs(
 
 fn parse_system_prompt_args(args: &[String]) -> Result<CliAction, String> {
     let mut cwd = env::current_dir().map_err(|error| error.to_string())?;
-    let mut date = DEFAULT_DATE.to_string();
+    let mut date = runtime::clock::current_date_utc();
     let mut index = 0;
 
     while index < args.len() {
@@ -3780,7 +3780,8 @@ fn status_context(
     let loader = ConfigLoader::default_for(&cwd);
     let discovered_config_files = loader.discover().len();
     let runtime_config = loader.load()?;
-    let project_context = ProjectContext::discover_with_git(&cwd, DEFAULT_DATE)?;
+    let project_context =
+        ProjectContext::discover_with_git(&cwd, runtime::clock::current_date_utc())?;
     let (project_root, git_branch) =
         parse_git_status_metadata(project_context.git_status.as_deref());
     let git_summary = parse_git_workspace_summary(project_context.git_status.as_deref());
@@ -4240,7 +4241,7 @@ fn render_config_report(section: Option<&str>) -> Result<String, Box<dyn std::er
 
 fn render_memory_report() -> Result<String, Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
-    let project_context = ProjectContext::discover(&cwd, DEFAULT_DATE)?;
+    let project_context = ProjectContext::discover(&cwd, runtime::clock::current_date_utc())?;
     let mut lines = vec![format!(
         "Memory
   Working directory {}
@@ -4861,7 +4862,7 @@ fn resolve_export_path(
 fn build_system_prompt() -> Result<Vec<String>, Box<dyn std::error::Error>> {
     Ok(load_system_prompt(
         env::current_dir()?,
-        DEFAULT_DATE,
+        runtime::clock::current_date_utc(),
         env::consts::OS,
         "unknown",
     )?)

@@ -470,10 +470,17 @@ impl HookRunner {
         child.stderr(Stdio::piped());
         child.env("HOOK_EVENT", event.as_str());
         child.env("HOOK_TOOL_NAME", tool_name);
-        child.env("HOOK_TOOL_INPUT", tool_input);
+        // env-блок процесса ограничен ОС (~1МБ суммарно на macOS): полный
+        // tool_input/output правки большого файла превышает лимит, и spawn
+        // падает с E2BIG — успешный edit превращался в ошибку хука. В env
+        // кладём усечённые копии, полные данные всегда в JSON на stdin.
+        child.env("HOOK_TOOL_INPUT", truncate_for_env(tool_input));
         child.env("HOOK_TOOL_IS_ERROR", if is_error { "1" } else { "0" });
         if let Some(tool_output) = tool_output {
-            child.env("HOOK_TOOL_OUTPUT", tool_output);
+            child.env("HOOK_TOOL_OUTPUT", truncate_for_env(tool_output));
+        }
+        if let Some(file_path) = extract_file_path(tool_input) {
+            child.env("HOOK_FILE_PATH", file_path);
         }
 
         let timeout = hook_timeout();
@@ -670,6 +677,33 @@ fn hook_payload(
 
 fn parse_tool_input(tool_input: &str) -> Value {
     serde_json::from_str(tool_input).unwrap_or_else(|_| json!({ "raw": tool_input }))
+}
+
+/// Бюджет на одну env-переменную хука; выбран с запасом от лимита ОС на весь
+/// env-блок (macOS: `ARG_MAX` = 1МБ на env+argv суммарно).
+const MAX_HOOK_ENV_BYTES: usize = 32 * 1024;
+
+fn truncate_for_env(value: &str) -> String {
+    if value.len() <= MAX_HOOK_ENV_BYTES {
+        return value.to_string();
+    }
+    let mut end = MAX_HOOK_ENV_BYTES;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…[truncated; full payload on stdin]", &value[..end])
+}
+
+/// Путь редактируемого файла из tool input — отдельной переменной
+/// `HOOK_FILE_PATH`, чтобы хукам не приходилось выковыривать его grep'ом из
+/// (возможно, усечённого) JSON.
+fn extract_file_path(tool_input: &str) -> Option<String> {
+    let parsed: Value = serde_json::from_str(tool_input).ok()?;
+    ["file_path", "path", "notebook_path"]
+        .iter()
+        .find_map(|key| parsed.get(key))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
 }
 
 fn format_hook_failure(command: &str, code: i32, stdout: Option<&str>, stderr: &str) -> String {
@@ -1063,6 +1097,43 @@ mod tests {
 
         assert!(!result.is_failed());
         assert_eq!(result.messages(), &["post ok".to_string()]);
+    }
+
+    #[test]
+    fn huge_tool_output_does_not_break_hook_spawn() {
+        // Env-блок процесса ограничен ОС (~1МБ): раньше полный tool_output в
+        // HOOK_TOOL_OUTPUT ронял spawn с E2BIG, и успешная правка большого
+        // файла превращалась в ошибку хука.
+        let runner = HookRunner::new(RuntimeHookConfig::new(
+            Vec::new(),
+            vec![shell_snippet("printf 'post ok'")],
+            Vec::new(),
+        ));
+        let huge_output = "y".repeat(2 * 1024 * 1024);
+
+        let result =
+            runner.run_post_tool_use("edit_file", r#"{"path":"a.rs"}"#, &huge_output, false);
+
+        assert!(!result.is_failed(), "{:?}", result.messages());
+        assert_eq!(result.messages(), &["post ok".to_string()]);
+    }
+
+    #[test]
+    fn exposes_extracted_file_path_to_hooks() {
+        let runner = HookRunner::new(RuntimeHookConfig::new(
+            Vec::new(),
+            vec![shell_snippet("printf '%s' \"$HOOK_FILE_PATH\"")],
+            Vec::new(),
+        ));
+
+        let result = runner.run_post_tool_use(
+            "edit_file",
+            r#"{"path":"src/lib.rs","old_string":"a","new_string":"b"}"#,
+            "done",
+            false,
+        );
+
+        assert_eq!(result.messages(), &["src/lib.rs".to_string()]);
     }
 
     #[test]

@@ -7,6 +7,7 @@
 mod bash;
 pub mod bash_validation;
 mod bootstrap;
+pub mod clock;
 mod compact;
 mod config;
 mod conversation;

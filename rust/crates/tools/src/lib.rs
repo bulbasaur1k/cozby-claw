@@ -18,7 +18,7 @@ use runtime::{
     read_file,
     summary_compression::compress_summary_text,
     TaskPacket,
-    task_registry::TaskRegistry,
+    task_registry::{TaskRegistry, TaskStatus},
     team_cron_registry::{CronRegistry, TeamRegistry},
     worker_boot::{WorkerReadySnapshot, WorkerRegistry},
     write_file, ApiClient, ApiRequest, AssistantEvent, BashCommandInput, BashCommandOutput,
@@ -385,7 +385,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
     vec![
         ToolSpec {
             name: "bash",
-            description: "Execute a shell command in the current workspace.",
+            description: "Execute a shell command in the current workspace. With run_in_background=true it returns a backgroundTaskId immediately; track it with TaskGet/TaskOutput/TaskStop. Long jobs (builds, test suites) take minutes — re-check with increasing delays instead of polling in a tight loop.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1421,20 +1421,43 @@ fn run_task_packet(input: TaskPacket) -> Result<String, String> {
 }
 
 #[allow(clippy::needless_pass_by_value)]
+/// Временнáя сводка задачи. Голые epoch-секунды без точки отсчёта не давали
+/// модели понять, сколько задача уже бежит, — она поллила ежесекундно.
+fn task_time_fields(task: &runtime::task_registry::Task) -> Value {
+    let now = runtime::clock::now_epoch_secs();
+    json!({
+        "created_at": runtime::clock::epoch_secs_to_iso8601(task.created_at),
+        "updated_at": runtime::clock::epoch_secs_to_iso8601(task.updated_at),
+        "now": runtime::clock::epoch_secs_to_iso8601(now),
+        "running_for_seconds": now.saturating_sub(task.created_at),
+        "seconds_since_last_update": now.saturating_sub(task.updated_at),
+    })
+}
+
+fn task_json(task: &runtime::task_registry::Task, include_messages: bool) -> Value {
+    let mut body = json!({
+        "task_id": task.task_id,
+        "status": task.status,
+        "prompt": task.prompt,
+        "description": task.description,
+        "task_packet": task.task_packet,
+        "team_id": task.team_id,
+        "pid": task.pid,
+        "log_path": task.log_path,
+    });
+    if include_messages {
+        body["messages"] = json!(task.messages);
+    }
+    if let (Value::Object(target), Value::Object(times)) = (&mut body, task_time_fields(task)) {
+        target.extend(times);
+    }
+    body
+}
+
 fn run_task_get(input: TaskIdInput) -> Result<String, String> {
     let registry = global_task_registry();
     match registry.get(&input.task_id) {
-        Some(task) => to_pretty_json(json!({
-            "task_id": task.task_id,
-            "status": task.status,
-            "prompt": task.prompt,
-            "description": task.description,
-            "task_packet": task.task_packet,
-            "created_at": task.created_at,
-            "updated_at": task.updated_at,
-            "messages": task.messages,
-            "team_id": task.team_id
-        })),
+        Some(task) => to_pretty_json(task_json(&task, true)),
         None => Err(format!("task not found: {}", input.task_id)),
     }
 }
@@ -1444,18 +1467,7 @@ fn run_task_list(_input: Value) -> Result<String, String> {
     let tasks: Vec<_> = registry
         .list(None)
         .into_iter()
-        .map(|t| {
-            json!({
-                "task_id": t.task_id,
-                "status": t.status,
-                "prompt": t.prompt,
-                "description": t.description,
-                "task_packet": t.task_packet,
-                "created_at": t.created_at,
-                "updated_at": t.updated_at,
-                "team_id": t.team_id
-            })
-        })
+        .map(|task| task_json(&task, false))
         .collect();
     to_pretty_json(json!({
         "tasks": tasks,
@@ -1467,13 +1479,32 @@ fn run_task_list(_input: Value) -> Result<String, String> {
 fn run_task_stop(input: TaskIdInput) -> Result<String, String> {
     let registry = global_task_registry();
     match registry.stop(&input.task_id) {
-        Ok(task) => to_pretty_json(json!({
-            "task_id": task.task_id,
-            "status": task.status,
-            "message": "Task stopped"
-        })),
+        Ok(task) => {
+            // У фоновой bash-задачи есть живой подпроцесс — остановка без kill
+            // лишь меняла бы статус, а билд продолжал бы крутиться.
+            if let Some(pid) = task.pid {
+                terminate_pid(pid);
+            }
+            to_pretty_json(json!({
+                "task_id": task.task_id,
+                "status": task.status,
+                "message": "Task stopped"
+            }))
+        }
         Err(e) => Err(e),
     }
+}
+
+#[cfg(unix)]
+fn terminate_pid(pid: u32) {
+    let _ = Command::new("kill").arg(pid.to_string()).status();
+}
+
+#[cfg(not(unix))]
+fn terminate_pid(pid: u32) {
+    let _ = Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .status();
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -1493,14 +1524,43 @@ fn run_task_update(input: TaskUpdateInput) -> Result<String, String> {
 #[allow(clippy::needless_pass_by_value)]
 fn run_task_output(input: TaskIdInput) -> Result<String, String> {
     let registry = global_task_registry();
-    match registry.output(&input.task_id) {
-        Ok(output) => to_pretty_json(json!({
-            "task_id": input.task_id,
-            "output": output,
-            "has_output": !output.is_empty()
-        })),
-        Err(e) => Err(e),
+    let task = registry
+        .get(&input.task_id)
+        .ok_or_else(|| format!("task not found: {}", input.task_id))?;
+    // Фоновый bash пишет в лог-файл; хвоста достаточно, чтобы увидеть исход
+    // билда, не втаскивая мегабайты в контекст.
+    let log_tail = task
+        .log_path
+        .as_deref()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .map(|content| tail_for_output(&content));
+    let output = match (log_tail, task.output.is_empty()) {
+        (Some(tail), true) => tail,
+        (Some(tail), false) => format!("{tail}{}", task.output),
+        (None, _) => task.output.clone(),
+    };
+    to_pretty_json(json!({
+        "task_id": input.task_id,
+        "status": task.status,
+        "output": output,
+        "has_output": !output.is_empty()
+    }))
+}
+
+/// Последние 16 КиБ вывода (по границе строк) — как truncate_output в bash,
+/// только с конца: для билдов важен именно хвост.
+fn tail_for_output(content: &str) -> String {
+    const MAX_TAIL_BYTES: usize = 16_384;
+    if content.len() <= MAX_TAIL_BYTES {
+        return content.to_string();
     }
+    let mut start = content.len() - MAX_TAIL_BYTES;
+    while start < content.len() && !content.is_char_boundary(start) {
+        start += 1;
+    }
+    let tail = &content[start..];
+    let tail = tail.find('\n').map_or(tail, |pos| &tail[pos + 1..]);
+    format!("[… beginning truncated, showing last 16384 bytes]\n{tail}")
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -1832,8 +1892,98 @@ fn run_bash(input: BashCommandInput) -> Result<String, String> {
     if let Some(output) = workspace_test_branch_preflight(&input.command) {
         return serde_json::to_string_pretty(&output).map_err(|error| error.to_string());
     }
+    if input.run_in_background.unwrap_or(false) {
+        return serde_json::to_string_pretty(&spawn_tracked_background_bash(&input)?)
+            .map_err(|error| error.to_string());
+    }
     serde_json::to_string_pretty(&execute_bash(input).map_err(|error| error.to_string())?)
         .map_err(|error| error.to_string())
+}
+
+/// Фоновая bash-команда как отслеживаемая задача. `runtime::execute_bash`
+/// возвращал голый PID и слал вывод в /dev/null — статус и результат билда
+/// были ненаблюдаемы, и модель поллила вслепую. Здесь: stdout+stderr в
+/// лог-файл, задача в реестре (TaskGet/TaskOutput/TaskStop работают по
+/// возвращённому `backgroundTaskId`), watcher-поток фиксирует момент и код
+/// завершения.
+fn spawn_tracked_background_bash(input: &BashCommandInput) -> Result<BashCommandOutput, String> {
+    let task = global_task_registry().create(&input.command, input.description.as_deref());
+
+    let log_dir = std::env::temp_dir().join("claw-background-tasks");
+    std::fs::create_dir_all(&log_dir).map_err(|error| error.to_string())?;
+    let log_path = log_dir.join(format!("{}.log", task.task_id));
+    let log_file = std::fs::File::create(&log_path).map_err(|error| error.to_string())?;
+    let log_for_stderr = log_file.try_clone().map_err(|error| error.to_string())?;
+
+    let child = Command::new("sh")
+        .arg("-lc")
+        .arg(&input.command)
+        .stdin(std::process::Stdio::null())
+        .stdout(log_file)
+        .stderr(log_for_stderr)
+        .spawn()
+        .map_err(|error| format!("failed to spawn background command: {error}"))?;
+
+    let registry = global_task_registry();
+    let pid = child.id();
+    registry
+        .attach_process(&task.task_id, pid, &log_path.to_string_lossy())
+        .map_err(|error| error.to_string())?;
+    registry
+        .set_status(&task.task_id, TaskStatus::Running)
+        .map_err(|error| error.to_string())?;
+
+    let task_id = task.task_id.clone();
+    std::thread::spawn(move || {
+        let mut child = child;
+        let status = child.wait();
+        let registry = global_task_registry();
+        let _ = registry.clear_pid(&task_id);
+        match status {
+            Ok(status) if status.success() => {
+                let _ = registry.append_output(&task_id, "[exit code 0]\n");
+                let _ = registry
+                    .set_status(&task_id, TaskStatus::Completed);
+            }
+            Ok(status) => {
+                let _ = registry.append_output(
+                    &task_id,
+                    &format!("[exit code {}]\n", status.code().unwrap_or(-1)),
+                );
+                let _ =
+                    registry.set_status(&task_id, TaskStatus::Failed);
+            }
+            Err(error) => {
+                let _ = registry
+                    .append_output(&task_id, &format!("[wait failed: {error}]\n"));
+                let _ =
+                    registry.set_status(&task_id, TaskStatus::Failed);
+            }
+        }
+    });
+
+    Ok(BashCommandOutput {
+        stdout: format!(
+            "Started background task {id} (pid {pid}). Check status with TaskGet {{\"task_id\":\"{id}\"}} \
+             and read output with TaskOutput; builds can take minutes — poll with increasing delays, \
+             not in a tight loop.",
+            id = task.task_id
+        ),
+        stderr: String::new(),
+        raw_output_path: Some(log_path.to_string_lossy().into_owned()),
+        interrupted: false,
+        is_image: None,
+        background_task_id: Some(task.task_id),
+        backgrounded_by_user: Some(false),
+        assistant_auto_backgrounded: Some(false),
+        dangerously_disable_sandbox: input.dangerously_disable_sandbox,
+        return_code_interpretation: None,
+        no_output_expected: Some(false),
+        structured_content: None,
+        persisted_output_path: None,
+        persisted_output_size: None,
+        sandbox_status: None,
+    })
 }
 
 fn workspace_test_branch_preflight(command: &str) -> Option<BashCommandOutput> {
@@ -2491,6 +2641,17 @@ struct AgentOutput {
     /// Позволяет `AgentGet`/`AgentWait` вернуть результат без парсинга `.md`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     result: Option<String>,
+    /// Текущий момент — проставляется при чтении манифеста, чтобы модель
+    /// могла сопоставить `createdAt`/`startedAt` с «сейчас».
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    now: Option<String>,
+    /// Сколько секунд агент уже выполняется (только для `running`).
+    #[serde(
+        rename = "runningForSeconds",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    running_for_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -3156,7 +3317,6 @@ fn resolve_skill_path(skill: &str) -> Result<std::path::PathBuf, String> {
 }
 
 const DEFAULT_AGENT_MODEL: &str = "claude-opus-4-6";
-const DEFAULT_AGENT_SYSTEM_DATE: &str = "2026-03-31";
 const DEFAULT_AGENT_MAX_ITERATIONS: usize = 32;
 /// Сколько под-агентов может *фактически* работать одновременно. Ограничивает
 /// параллельные обращения к (слабой/локальной) модели, а не число потоков —
@@ -3234,6 +3394,8 @@ where
         error: None,
         pid: Some(std::process::id()),
         result: None,
+        now: None,
+        running_for_seconds: None,
     };
     write_agent_manifest(&manifest)?;
 
@@ -3524,7 +3686,27 @@ fn load_agent_manifest(agent_id: &str) -> Result<AgentOutput, String> {
             error.to_string()
         }
     })?;
-    serde_json::from_str::<AgentOutput>(&contents).map_err(|error| error.to_string())
+    let mut manifest =
+        serde_json::from_str::<AgentOutput>(&contents).map_err(|error| error.to_string())?;
+    annotate_manifest_time(&mut manifest);
+    Ok(manifest)
+}
+
+/// Проставляет `now` и `runningForSeconds` при чтении манифеста. Старые
+/// манифесты с epoch-секундами вместо ISO просто не получают elapsed.
+fn annotate_manifest_time(manifest: &mut AgentOutput) {
+    let now = runtime::clock::now_epoch_secs();
+    manifest.now = Some(runtime::clock::epoch_secs_to_iso8601(now));
+    manifest.running_for_seconds = (manifest.status == "running")
+        .then(|| {
+            manifest
+                .started_at
+                .as_deref()
+                .or(Some(manifest.created_at.as_str()))
+                .and_then(runtime::clock::iso8601_to_epoch_secs)
+                .map(|started| now.saturating_sub(started))
+        })
+        .flatten();
 }
 
 fn list_agent_manifests(status_filter: Option<&str>) -> Result<Vec<AgentOutput>, String> {
@@ -3548,6 +3730,9 @@ fn list_agent_manifests(status_filter: Option<&str>) -> Result<Vec<AgentOutput>,
         .collect::<Vec<_>>();
     // Стабильный порядок по id (`agent-<nanos>` лексикографически = хронологически).
     manifests.sort_by(|left, right| left.agent_id.cmp(&right.agent_id));
+    for manifest in &mut manifests {
+        annotate_manifest_time(manifest);
+    }
     Ok(manifests)
 }
 
@@ -3598,7 +3783,7 @@ fn build_agent_system_prompt(subagent_type: &str) -> Result<Vec<String>, String>
     let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
     let mut prompt = load_system_prompt(
         cwd,
-        DEFAULT_AGENT_SYSTEM_DATE.to_string(),
+        runtime::clock::current_date_utc(),
         std::env::consts::OS,
         "unknown",
     )
@@ -4312,12 +4497,11 @@ fn normalize_subagent_type(subagent_type: Option<&str>) -> String {
     }
 }
 
+/// Настоящий ISO-8601 (UTC). Раньше тут возвращались epoch-секунды строкой —
+/// `createdAt: "1783123456"` в манифестах агентов не читалось ни моделью, ни
+/// человеком, и агент не мог оценить, сколько задача уже выполняется.
 fn iso8601_now() -> String {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-        .to_string()
+    runtime::clock::iso8601_now()
 }
 
 #[allow(clippy::too_many_lines)]
@@ -6865,8 +7049,19 @@ mod tests {
         )
         .expect("bash background should succeed");
         let background_output: serde_json::Value = serde_json::from_str(&background).expect("json");
-        assert!(background_output["backgroundTaskId"].as_str().is_some());
-        assert_eq!(background_output["noOutputExpected"], true);
+        let task_id = background_output["backgroundTaskId"]
+            .as_str()
+            .expect("background task id");
+        assert!(task_id.starts_with("task_"), "trackable registry id");
+        // Фоновая команда теперь отслеживаемая задача: TaskGet знает статус
+        // и время, TaskOutput после завершения читает лог.
+        let task = execute_tool("TaskGet", &json!({ "task_id": task_id }))
+            .expect("TaskGet should know the background task");
+        let task: serde_json::Value = serde_json::from_str(&task).expect("json");
+        assert_eq!(task["status"], "running");
+        assert!(task["running_for_seconds"].as_u64().is_some());
+        assert!(task["now"].as_str().is_some_and(|now| now.ends_with('Z')));
+        assert!(task["pid"].as_u64().is_some());
     }
 
     #[test]
@@ -6981,7 +7176,14 @@ mod tests {
         let write_update_output: serde_json::Value =
             serde_json::from_str(&write_update).expect("json");
         assert_eq!(write_update_output["type"], "update");
-        assert_eq!(write_update_output["originalFile"], "alpha\nbeta\nalpha\n");
+        // Прежнее содержимое больше не эхо-ится в tool result (раздувало
+        // контекст на больших файлах); дифф доступен в structuredPatch.
+        assert!(write_update_output.get("originalFile").is_none());
+        assert_eq!(
+            write_update_output["structuredPatch"][0]["lines"],
+            json!(["-alpha", "+gamma"])
+        );
+        assert_eq!(write_update_output["structuredPatch"][0]["oldStart"], 3);
 
         let read_full = execute_tool("read_file", &json!({ "path": "nested/demo.txt" }))
             .expect("read full should succeed");

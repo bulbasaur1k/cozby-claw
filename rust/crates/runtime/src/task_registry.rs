@@ -42,6 +42,12 @@ pub struct Task {
     pub messages: Vec<TaskMessage>,
     pub output: String,
     pub team_id: Option<String>,
+    /// PID подпроцесса фоновой bash-задачи (пока она бежит) — для `TaskStop`.
+    #[serde(default)]
+    pub pid: Option<u32>,
+    /// Файл, куда фоновая задача пишет stdout+stderr — читается `TaskOutput`.
+    #[serde(default)]
+    pub log_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -116,9 +122,40 @@ impl TaskRegistry {
             messages: Vec::new(),
             output: String::new(),
             team_id: None,
+            pid: None,
+            log_path: None,
         };
         inner.tasks.insert(task_id, task.clone());
         task
+    }
+
+    /// Привязывает к задаче подпроцесс и его лог-файл (фоновый bash).
+    pub fn attach_process(
+        &self,
+        task_id: &str,
+        pid: u32,
+        log_path: &str,
+    ) -> Result<(), String> {
+        let mut inner = self.inner.lock().expect("registry lock poisoned");
+        let task = inner
+            .tasks
+            .get_mut(task_id)
+            .ok_or_else(|| format!("task not found: {task_id}"))?;
+        task.pid = Some(pid);
+        task.log_path = Some(log_path.to_owned());
+        task.updated_at = now_secs();
+        Ok(())
+    }
+
+    /// Сбрасывает PID после завершения подпроцесса (лог-файл остаётся).
+    pub fn clear_pid(&self, task_id: &str) -> Result<(), String> {
+        let mut inner = self.inner.lock().expect("registry lock poisoned");
+        let task = inner
+            .tasks
+            .get_mut(task_id)
+            .ok_or_else(|| format!("task not found: {task_id}"))?;
+        task.pid = None;
+        Ok(())
     }
 
     pub fn get(&self, task_id: &str) -> Option<Task> {

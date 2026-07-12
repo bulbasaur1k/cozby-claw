@@ -114,6 +114,8 @@ mod tests {
             error: None,
             pid: None,
             result: None,
+            now: None,
+            running_for_seconds: None,
         }
     }
     

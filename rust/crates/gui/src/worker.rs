@@ -27,8 +27,6 @@ use tools::{mvp_tool_specs, GlobalToolRegistry};
 
 use crate::protocol::{Activity, AgentHandle, AgentToUi, UiToAgent};
 
-const PROMPT_DATE: &str = "2026-06-26";
-
 /// Строит клиента основной модели из секции `[primary]` файла providers.toml.
 /// Поддерживает Anthropic и любой OpenAI-совместимый провайдер.
 fn build_provider_client(
@@ -95,7 +93,7 @@ fn build_policy(mode: PermissionMode) -> PermissionPolicy {
 fn system_prompt(cwd: &Path) -> Vec<String> {
     load_system_prompt(
         cwd.to_path_buf(),
-        PROMPT_DATE.to_string(),
+        runtime::clock::current_date_utc(),
         std::env::consts::OS,
         "unknown",
     )

@@ -28,7 +28,6 @@ use tools::{mvp_tool_specs, GlobalToolRegistry};
 
 use super::protocol::{Activity, AgentHandle, AgentToUi, UiToAgent};
 
-const PROMPT_DATE: &str = "2026-06-26";
 
 /// Строит клиента основной модели из секции `[primary]` файла providers.toml.
 /// Поддерживает Anthropic и любой OpenAI-совместимый провайдер.
@@ -96,7 +95,9 @@ fn build_policy(mode: PermissionMode) -> PermissionPolicy {
 fn system_prompt(cwd: &Path) -> Vec<String> {
     load_system_prompt(
         cwd.to_path_buf(),
-        PROMPT_DATE.to_string(),
+        // Живая дата: захардкоженное «сегодня» ломало модели все рассуждения
+        // о времени (сколько бежит билд, свежесть коммитов и т.п.).
+        runtime::clock::current_date_utc(),
         std::env::consts::OS,
         "unknown",
     )
