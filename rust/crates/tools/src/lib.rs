@@ -385,7 +385,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
     vec![
         ToolSpec {
             name: "bash",
-            description: "Execute a shell command in the current workspace. With run_in_background=true it returns a backgroundTaskId immediately; track it with TaskGet/TaskOutput/TaskStop. Long jobs (builds, test suites) take minutes — re-check with increasing delays instead of polling in a tight loop.",
+            description: "Execute a shell command in the current workspace. With run_in_background=true it returns a backgroundTaskId immediately; wait for it with TaskWait (blocks until done or timeout — the right way to wait for builds), peek with TaskGet/TaskOutput, kill with TaskStop. Never poll TaskGet in a loop.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -878,6 +878,20 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             required_permission: PermissionMode::ReadOnly,
         },
         ToolSpec {
+            name: "TaskWait",
+            description: "Block until a background task finishes or timeout_seconds elapses (default 120, max 1800), then return its status, timing, and the tail of its output. Use this instead of calling TaskGet in a loop: one TaskWait call replaces minutes of polling. For long builds call TaskWait repeatedly with a generous timeout until status is no longer 'running'.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "task_id": { "type": "string" },
+                    "timeout_seconds": { "type": "integer", "minimum": 1, "maximum": 1800 }
+                },
+                "required": ["task_id"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
             name: "TaskList",
             description: "List all background tasks and their current status.",
             input_schema: json!({
@@ -1291,6 +1305,7 @@ fn execute_tool_with_enforcer(
         "TaskCreate" => from_value::<TaskCreateInput>(input).and_then(run_task_create),
         "RunTaskPacket" => from_value::<TaskPacket>(input).and_then(run_task_packet),
         "TaskGet" => from_value::<TaskIdInput>(input).and_then(run_task_get),
+        "TaskWait" => from_value::<TaskWaitInput>(input).and_then(run_task_wait),
         "TaskList" => run_task_list(input.clone()),
         "TaskStop" => from_value::<TaskIdInput>(input).and_then(run_task_stop),
         "TaskUpdate" => from_value::<TaskUpdateInput>(input).and_then(run_task_update),
@@ -1462,6 +1477,53 @@ fn run_task_get(input: TaskIdInput) -> Result<String, String> {
     }
 }
 
+/// Блокирующее ожидание фоновой задачи — аналог `wait_for_agent`, но для
+/// задач из `run_in_background`. Без него модель поллила TaskGet каждый ход:
+/// 20-минутный docker-билд превращался в тысячи пустых запросов. Один вызов
+/// `TaskWait` ждёт до `timeout_seconds` внутри тула (двойной Esc в TUI
+/// по-прежнему бросает зависший ход) и возвращает статус + хвост вывода.
+#[allow(clippy::needless_pass_by_value)]
+fn run_task_wait(input: TaskWaitInput) -> Result<String, String> {
+    const DEFAULT_TIMEOUT_SECS: u64 = 120;
+    const MAX_TIMEOUT_SECS: u64 = 1800;
+    let timeout_secs = input
+        .timeout_seconds
+        .filter(|secs| *secs > 0)
+        .unwrap_or(DEFAULT_TIMEOUT_SECS)
+        .min(MAX_TIMEOUT_SECS);
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    let poll = Duration::from_millis(500);
+    let registry = global_task_registry();
+    loop {
+        let task = registry
+            .get(&input.task_id)
+            .ok_or_else(|| format!("task not found: {}", input.task_id))?;
+        let finished = !matches!(task.status, TaskStatus::Created | TaskStatus::Running);
+        let timed_out = !finished && Instant::now() >= deadline;
+        if finished || timed_out {
+            let mut body = task_json(&task, false);
+            if let Value::Object(target) = &mut body {
+                target.insert("timed_out".into(), json!(timed_out));
+                target.insert("waited_seconds".into(), json!(timeout_secs.saturating_sub(
+                    deadline.saturating_duration_since(Instant::now()).as_secs(),
+                )));
+                target.insert("output_tail".into(), json!(task_output_text(&task)));
+                if timed_out {
+                    target.insert(
+                        "note".into(),
+                        json!(format!(
+                            "still running after {timeout_secs}s — call TaskWait again \
+                             (long builds can take 20+ minutes; this is normal)"
+                        )),
+                    );
+                }
+            }
+            return to_pretty_json(body);
+        }
+        std::thread::sleep(poll);
+    }
+}
+
 fn run_task_list(_input: Value) -> Result<String, String> {
     let registry = global_task_registry();
     let tasks: Vec<_> = registry
@@ -1522,23 +1584,28 @@ fn run_task_update(input: TaskUpdateInput) -> Result<String, String> {
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_task_output(input: TaskIdInput) -> Result<String, String> {
-    let registry = global_task_registry();
-    let task = registry
-        .get(&input.task_id)
-        .ok_or_else(|| format!("task not found: {}", input.task_id))?;
-    // Фоновый bash пишет в лог-файл; хвоста достаточно, чтобы увидеть исход
-    // билда, не втаскивая мегабайты в контекст.
+/// Хвост вывода задачи: лог-файл фонового bash + сообщения реестра.
+/// Хвоста достаточно, чтобы увидеть исход билда, не втаскивая мегабайты
+/// в контекст.
+fn task_output_text(task: &runtime::task_registry::Task) -> String {
     let log_tail = task
         .log_path
         .as_deref()
         .and_then(|path| std::fs::read_to_string(path).ok())
         .map(|content| tail_for_output(&content));
-    let output = match (log_tail, task.output.is_empty()) {
+    match (log_tail, task.output.is_empty()) {
         (Some(tail), true) => tail,
         (Some(tail), false) => format!("{tail}{}", task.output),
         (None, _) => task.output.clone(),
-    };
+    }
+}
+
+fn run_task_output(input: TaskIdInput) -> Result<String, String> {
+    let registry = global_task_registry();
+    let task = registry
+        .get(&input.task_id)
+        .ok_or_else(|| format!("task not found: {}", input.task_id))?;
+    let output = task_output_text(&task);
     to_pretty_json(json!({
         "task_id": input.task_id,
         "status": task.status,
@@ -1964,9 +2031,10 @@ fn spawn_tracked_background_bash(input: &BashCommandInput) -> Result<BashCommand
 
     Ok(BashCommandOutput {
         stdout: format!(
-            "Started background task {id} (pid {pid}). Check status with TaskGet {{\"task_id\":\"{id}\"}} \
-             and read output with TaskOutput; builds can take minutes — poll with increasing delays, \
-             not in a tight loop.",
+            "Started background task {id} (pid {pid}). Wait for it with TaskWait \
+             {{\"task_id\":\"{id}\",\"timeout_seconds\":300}} — it blocks until the task finishes \
+             (or the timeout passes; just call it again while status is \"running\"). Builds can \
+             take 20+ minutes — do NOT poll TaskGet in a loop.",
             id = task.task_id
         ),
         stderr: String::new(),
@@ -2455,6 +2523,12 @@ struct TaskCreateInput {
 #[derive(Debug, Deserialize)]
 struct TaskIdInput {
     task_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct TaskWaitInput {
+    task_id: String,
+    timeout_seconds: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -7062,6 +7136,40 @@ mod tests {
         assert!(task["running_for_seconds"].as_u64().is_some());
         assert!(task["now"].as_str().is_some_and(|now| now.ends_with('Z')));
         assert!(task["pid"].as_u64().is_some());
+
+        // TaskWait блокируется до завершения задачи вместо поллинга TaskGet.
+        let waited = execute_tool(
+            "TaskWait",
+            &json!({ "task_id": task_id, "timeout_seconds": 30 }),
+        )
+        .expect("TaskWait should block until the task finishes");
+        let waited: serde_json::Value = serde_json::from_str(&waited).expect("json");
+        assert_eq!(waited["status"], "completed");
+        assert_eq!(waited["timed_out"], false);
+        assert!(waited["output_tail"]
+            .as_str()
+            .is_some_and(|tail| tail.contains("[exit code 0]")));
+
+        // Истёкший таймаут — не ошибка: статус running + подсказка ждать дальше.
+        let slow = execute_tool(
+            "bash",
+            &json!({ "command": "sleep 30", "run_in_background": true }),
+        )
+        .expect("bash background should succeed");
+        let slow: serde_json::Value = serde_json::from_str(&slow).expect("json");
+        let slow_id = slow["backgroundTaskId"].as_str().expect("task id");
+        let timed_out = execute_tool(
+            "TaskWait",
+            &json!({ "task_id": slow_id, "timeout_seconds": 1 }),
+        )
+        .expect("TaskWait timeout should return the running snapshot");
+        let timed_out: serde_json::Value = serde_json::from_str(&timed_out).expect("json");
+        assert_eq!(timed_out["status"], "running");
+        assert_eq!(timed_out["timed_out"], true);
+        assert!(timed_out["note"]
+            .as_str()
+            .is_some_and(|note| note.contains("call TaskWait again")));
+        execute_tool("TaskStop", &json!({ "task_id": slow_id })).expect("stop slow task");
     }
 
     #[test]
