@@ -169,7 +169,21 @@ fn worker(
             config.feature_config().clone()
         });
 
-    let api = match TuiApiClient::new(&model, &session.session_id, tx.clone(), Arc::clone(cancel)) {
+    // Внешняя консультация (обезличенный поход в мощную модель): resolve тот же,
+    // что в REPL — [auxiliary] из providers.toml либо externalConsult из конфига.
+    let external_consult = crate::ExternalConsultRuntime::resolve(
+        runtime_config
+            .as_ref()
+            .and_then(|config| config.external_consult()),
+    );
+
+    let api = match TuiApiClient::new(
+        &model,
+        &session.session_id,
+        tx.clone(),
+        Arc::clone(cancel),
+        external_consult.is_some(),
+    ) {
         Ok(client) => client,
         Err(error) => {
             let _ = tx.send(AgentToUi::Error(error.to_string()));
@@ -181,6 +195,7 @@ fn worker(
         tx: tx.clone(),
         cancel: Arc::clone(cancel),
         question_rx,
+        external_consult,
     };
     let policy = build_policy(mode).with_permission_rules(feature_config.permission_rules());
     let mut runtime = ConversationRuntime::new_with_features(
@@ -223,9 +238,12 @@ fn worker(
     }
 }
 
-fn tool_definitions() -> Vec<ToolDefinition> {
+fn tool_definitions(consult_enabled: bool) -> Vec<ToolDefinition> {
     mvp_tool_specs()
         .into_iter()
+        // Не настроенную внешнюю консультацию модели не показываем — иначе
+        // она зовёт тул и вечно получает ошибку (паритет с REPL-режимом).
+        .filter(|spec| consult_enabled || spec.name != "consult_external_model")
         .map(|spec| ToolDefinition {
             name: spec.name.to_string(),
             description: Some(spec.description.to_string()),
@@ -283,6 +301,8 @@ struct TuiApiClient {
     runtime: tokio::runtime::Runtime,
     tx: Sender<AgentToUi>,
     cancel: Arc<AtomicBool>,
+    /// Настроена ли внешняя консультация — иначе тул не анонсируется модели.
+    consult_enabled: bool,
 }
 
 impl TuiApiClient {
@@ -291,6 +311,7 @@ impl TuiApiClient {
         session_id: &str,
         tx: Sender<AgentToUi>,
         cancel: Arc<AtomicBool>,
+        consult_enabled: bool,
     ) -> Result<Self, RuntimeError> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
@@ -306,6 +327,7 @@ impl TuiApiClient {
             runtime,
             tx,
             cancel,
+            consult_enabled,
         })
     }
 }
@@ -349,7 +371,7 @@ impl ApiClient for TuiApiClient {
             messages: convert_messages(&request.messages),
             system: (!request.system_prompt.is_empty())
                 .then(|| request.system_prompt.join("\n\n")),
-            tools: Some(tool_definitions()),
+            tools: Some(tool_definitions(self.consult_enabled)),
             tool_choice: Some(ToolChoice::Auto),
             stream: true,
         };
@@ -443,6 +465,9 @@ struct GuiToolExecutor {
     tx: Sender<AgentToUi>,
     cancel: Arc<AtomicBool>,
     question_rx: Receiver<String>,
+    /// Внешняя консультация; ревью перед отправкой идёт через модалку UI
+    /// (stdin в TUI занят raw-режимом — REPL-промпт `[y/N]` тут невозможен).
+    external_consult: Option<crate::ExternalConsultRuntime>,
 }
 
 impl ToolExecutor for GuiToolExecutor {
@@ -452,6 +477,24 @@ impl ToolExecutor for GuiToolExecutor {
         }
         if tool_name == "AskUserQuestion" {
             return self.ask_user(input);
+        }
+        if tool_name == "consult_external_model" {
+            let result = self.run_external_consult(input);
+            match &result {
+                Ok(output) => {
+                    let _ = self.tx.send(AgentToUi::ToolResult {
+                        output: output.clone(),
+                        is_error: false,
+                    });
+                }
+                Err(error) => {
+                    let _ = self.tx.send(AgentToUi::ToolResult {
+                        output: error.to_string(),
+                        is_error: true,
+                    });
+                }
+            }
+            return result;
         }
 
         let _ = self.tx.send(AgentToUi::Activity(Activity::Tool {
@@ -510,6 +553,79 @@ impl GuiToolExecutor {
             Ok(answer) => Ok(answer),
             Err(_) => Err(ToolError::new("UI disconnected while awaiting an answer")),
         }
+    }
+
+    /// `consult_external_model` в TUI: тот же конвейер (secret-scan → анонимизация
+    /// → ревью → отправка → аудит), но ревью — модалкой через канал вопросов.
+    fn run_external_consult(&mut self, input: &str) -> Result<String, ToolError> {
+        #[derive(serde::Deserialize)]
+        struct ConsultRequest {
+            question: String,
+            #[serde(default)]
+            example: Option<String>,
+            #[serde(default)]
+            context: Option<String>,
+        }
+        let Some(consult) = self.external_consult.clone() else {
+            return Err(ToolError::new(
+                "external model consultation is not enabled; configure the [auxiliary] slot in \
+                 providers.toml or `externalConsult` in settings.json (see /external)",
+            ));
+        };
+        let request: ConsultRequest = serde_json::from_str(input)
+            .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
+        let sample = request.example.or(request.context);
+
+        let tx = self.tx.clone();
+        let question_rx = &self.question_rx;
+        consult.run_with_reviewer(
+            &request.question,
+            sample.as_deref(),
+            &mut |runtime, payload, anon| {
+                let redactions = anon.redactions();
+                let mut review = format!(
+                    "Внешняя консультация: отправить обезличенный запрос?\n  модель    {}\n  endpoint  {}\n",
+                    runtime.config.model, runtime.config.base_url
+                );
+                if redactions.is_empty() {
+                    review.push_str("  замен     нет\n");
+                } else {
+                    use std::fmt::Write as _;
+                    let _ = writeln!(review, "  замен     {} (плейсхолдер ← реальное):", redactions.len());
+                    for (placeholder, real) in &redactions {
+                        let _ = writeln!(review, "      {placeholder} ← {real}");
+                    }
+                }
+                review.push_str("  ── payload (обезличенный) ──\n");
+                for line in payload.lines() {
+                    review.push_str("  | ");
+                    review.push_str(line);
+                    review.push('\n');
+                }
+                let _ = tx.send(AgentToUi::Activity(Activity::Waiting {
+                    label: "external review".to_string(),
+                }));
+                let _ = tx.send(AgentToUi::AskUser {
+                    question: review,
+                    options: vec!["отправить".to_string(), "отменить".to_string()],
+                });
+                match question_rx.recv() {
+                    Ok(answer) => {
+                        let normalized = answer.trim().to_lowercase();
+                        Ok(
+                            if normalized.starts_with("отправ")
+                                || matches!(normalized.as_str(), "y" | "yes" | "да")
+                            {
+                                crate::ExternalReviewOutcome::Approved
+                            } else {
+                                crate::ExternalReviewOutcome::Declined
+                            },
+                        )
+                    }
+                    Err(_) => Ok(crate::ExternalReviewOutcome::Declined),
+                }
+            },
+        )
     }
 }
 

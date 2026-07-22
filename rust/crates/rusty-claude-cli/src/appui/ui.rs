@@ -296,6 +296,16 @@ struct LinkRegion {
     url: String,
 }
 
+/// Область блока кода (или diff-панели) в отрендеренной истории: диапазон
+/// строк → текст для копирования. Клик мышью по блоку копирует его в буфер
+/// обмена — «кнопка копирования» терминального интерфейса.
+#[derive(Debug, Clone)]
+struct CopyRegion {
+    first: usize,
+    last: usize,
+    text: String,
+}
+
 struct App {
     theme: Theme,
     model: String,
@@ -324,6 +334,10 @@ struct App {
     history_offset: u16,
     /// Ссылки активной вкладки в координатах отрендеренных строк (для клика).
     link_regions: Vec<LinkRegion>,
+    /// Блоки кода активной вкладки в координатах строк (клик — копировать).
+    copy_regions: Vec<CopyRegion>,
+    /// Короткое уведомление («скопировано») и момент показа.
+    flash: Option<(String, std::time::Instant)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -394,6 +408,8 @@ impl App {
             history_area: Rect::default(),
             history_offset: 0,
             link_regions: Vec::new(),
+            copy_regions: Vec::new(),
+            flash: None,
         };
         if app.active().entries.is_empty() {
             app.active_mut().push(Role::System, keymap_text());
@@ -442,9 +458,15 @@ impl App {
                         MouseEventKind::ScrollUp => self.scroll_history(3),
                         MouseEventKind::ScrollDown => self.scroll_history(-3),
                         MouseEventKind::Down(MouseButton::Left) => {
-                            // Клик по ссылке открывает её в браузере; UI не меняется.
-                            self.open_link_at(mouse.column, mouse.row);
-                            continue;
+                            // Клик по ссылке открывает её в браузере; клик по
+                            // блоку кода копирует его (показываем флеш — нужна
+                            // перерисовка).
+                            if self.open_link_at(mouse.column, mouse.row) {
+                                continue;
+                            }
+                            if !self.copy_code_at(mouse.column, mouse.row) {
+                                continue;
+                            }
                         }
                         // move/drag/прочие клики — не перерисовываемся зря
                         _ => continue,
@@ -534,6 +556,37 @@ impl App {
             return true;
         }
         false
+    }
+
+    /// Копирует блок кода под кликом в буфер обмена. Возвращает `true`, если
+    /// клик попал в блок (и надо перерисовать флеш-уведомление).
+    fn copy_code_at(&mut self, col: u16, row: u16) -> bool {
+        let area = self.history_area;
+        if area.width < 3
+            || area.height < 3
+            || col <= area.x
+            || row <= area.y
+            || col >= area.x + area.width - 1
+            || row >= area.y + area.height - 1
+        {
+            return false;
+        }
+        let content_row = (row - area.y - 1) as usize;
+        let line = self.history_offset as usize + content_row;
+        let Some(region) = self
+            .copy_regions
+            .iter()
+            .find(|r| line >= r.first && line <= r.last)
+        else {
+            return false;
+        };
+        let text = region.text.clone();
+        let message = match copy_text_to_clipboard(&text) {
+            Ok(()) => format!("✓ скопировано {} строк", text.lines().count()),
+            Err(error) => format!("✗ копирование: {error}"),
+        };
+        self.flash = Some((message, std::time::Instant::now()));
+        true
     }
 
     // --- клавиши ------------------------------------------------------------
@@ -1441,24 +1494,34 @@ impl App {
     fn draw_history(&mut self, frame: &mut Frame, area: Rect) {
         let theme = self.theme;
         let width = area.width.saturating_sub(2).max(1) as usize;
-        let (lines, regions) = self.history_lines(width);
+        let (lines, regions, copies) = self.history_lines(width);
         let viewport = area.height.saturating_sub(2);
         let total = u16::try_from(lines.len()).unwrap_or(u16::MAX);
         let max_scroll = total.saturating_sub(viewport);
         let scroll_back = self.active().scroll_back.min(max_scroll);
         self.active_mut().scroll_back = scroll_back;
         let offset = max_scroll.saturating_sub(scroll_back);
-        // Сохраняем геометрию и карту ссылок — чтобы открыть ссылку по клику мышью.
+        // Сохраняем геометрию и карты ссылок/кода — для кликов мышью.
         self.history_area = area;
         self.history_offset = offset;
         self.link_regions = regions;
+        self.copy_regions = copies;
+        // Флеш-уведомление («скопировано») живёт в заголовке пару секунд.
+        if self
+            .flash
+            .as_ref()
+            .is_some_and(|(_, at)| at.elapsed() > std::time::Duration::from_millis(2500))
+        {
+            self.flash = None;
+        }
+        let title = match &self.flash {
+            Some((message, _)) => format!(" {} — {message} ", self.active().title),
+            None => format!(" {} ", self.active().title),
+        };
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(theme.muted))
-            .title(Span::styled(
-                format!(" {} ", self.active().title),
-                Style::default().fg(theme.accent2),
-            ));
+            .title(Span::styled(title, Style::default().fg(theme.accent2)));
         frame.render_widget(
             Paragraph::new(Text::from(lines))
                 .block(block)
@@ -1467,18 +1530,30 @@ impl App {
         );
     }
 
-    fn history_lines(&self, width: usize) -> (Vec<Line<'static>>, Vec<LinkRegion>) {
+    fn history_lines(
+        &self,
+        width: usize,
+    ) -> (Vec<Line<'static>>, Vec<LinkRegion>, Vec<CopyRegion>) {
         let theme = self.theme;
         let mut lines = Vec::new();
         let mut regions = Vec::new();
+        let mut copies = Vec::new();
         for entry in &self.active().entries {
             if entry.role == Role::Assistant {
-                self.push_markdown(&mut lines, &mut regions, &entry.text, width);
+                self.push_markdown(&mut lines, &mut regions, &mut copies, &entry.text, width);
                 lines.push(Line::from(""));
                 continue;
             }
             if entry.role == Role::Diff {
+                let first = lines.len();
                 self.push_edit_diff(&mut lines, &entry.text, entry.lang.as_deref(), width);
+                if lines.len() > first {
+                    copies.push(CopyRegion {
+                        first,
+                        last: lines.len() - 1,
+                        text: diff_new_version(&entry.text),
+                    });
+                }
                 continue;
             }
             let (prefix, color, dim) = match entry.role {
@@ -1506,7 +1581,7 @@ impl App {
                 lines.push(Line::from(""));
             }
         }
-        (lines, regions)
+        (lines, regions, copies)
     }
 
     /// Рендер markdown-ответа ассистента в ratatui-строки: заголовки, **жирный**,
@@ -1517,6 +1592,7 @@ impl App {
         &self,
         lines: &mut Vec<Line<'static>>,
         regions: &mut Vec<LinkRegion>,
+        copies: &mut Vec<CopyRegion>,
         text: &str,
         width: usize,
     ) {
@@ -1537,7 +1613,16 @@ impl App {
                 }
                 MdEvent::End(TagEnd::CodeBlock) => {
                     in_code = false;
-                    self.push_code_block(lines, code_buf.trim_end_matches('\n'), &code_lang, width);
+                    let code = code_buf.trim_end_matches('\n');
+                    let first = lines.len();
+                    self.push_code_block(lines, code, &code_lang, width);
+                    if lines.len() > first {
+                        copies.push(CopyRegion {
+                            first,
+                            last: lines.len() - 1,
+                            text: code.to_string(),
+                        });
+                    }
                     lines.push(Line::from(""));
                 }
                 MdEvent::Text(t) if in_code => code_buf.push_str(&t),
@@ -1593,7 +1678,16 @@ impl App {
             }
         }
         if in_code && !code_buf.is_empty() {
-            self.push_code_block(lines, code_buf.trim_end_matches('\n'), &code_lang, width);
+            let code = code_buf.trim_end_matches('\n');
+            let first = lines.len();
+            self.push_code_block(lines, code, &code_lang, width);
+            if lines.len() > first {
+                copies.push(CopyRegion {
+                    first,
+                    last: lines.len() - 1,
+                    text: code.to_string(),
+                });
+            }
         }
         md.flush(lines);
         regions.append(&mut md.link_regions);
@@ -1996,43 +2090,57 @@ fn parse_permission_label(label: &str) -> Option<PermissionMode> {
     }
 }
 
-/// Максимум строк на сторону в diff-панели правки (чтобы не заливать экран).
-const DIFF_MAX_LINES: usize = 40;
+/// Максимум строк в diff-панели правки (чтобы не заливать экран).
+const DIFF_MAX_LINES: usize = 80;
 
 /// Строит unified-diff-текст для правки Edit/Write из JSON-инпута тула. `None`,
 /// если это не файловая правка или инпут не распарсился.
+///
+/// Раньше показывались «все - строки, потом все + строки» — две версии подряд.
+/// Теперь честный построчный diff через `runtime::diff`: изменения перемежаются
+/// с контекстом, как в `git diff`.
 fn build_edit_diff(name: &str, input: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(input).ok()?;
     match name {
         "edit_file" => {
             let old = value.get("old_string")?.as_str()?;
             let new = value.get("new_string")?.as_str()?;
-            let mut out = String::new();
-            push_diff_side(&mut out, old, '-');
-            push_diff_side(&mut out, new, '+');
-            Some(out)
+            Some(render_diff_ops(old, new))
         }
         "write_file" => {
             let content = value.get("content")?.as_str()?;
-            let mut out = String::new();
-            push_diff_side(&mut out, content, '+');
-            Some(out)
+            // Перезапись существующего файла — покажем, что именно заменяется,
+            // а не только новую версию. Превью строится до применения правки,
+            // так что на диске ещё старое содержимое. Если файл не читается
+            // (новый файл) или уже совпадает с новым содержимым (правка уже
+            // применена) — деградируем до «всё добавлено».
+            let disk = value
+                .get("path")
+                .and_then(|path| path.as_str())
+                .and_then(|path| std::fs::read_to_string(path).ok())
+                .filter(|existing| existing != content);
+            match disk {
+                Some(existing) => Some(render_diff_ops(&existing, content)),
+                None => Some(render_diff_ops("", content)),
+            }
         }
         _ => None,
     }
 }
 
-/// Дописывает строки одной стороны diff с маркером (`+`/`-`), обрезая до лимита.
-fn push_diff_side(out: &mut String, text: &str, marker: char) {
-    let lines: Vec<&str> = text.lines().collect();
-    for line in lines.iter().take(DIFF_MAX_LINES) {
-        out.push(marker);
-        out.push_str(line);
+/// Unified-diff-текст (маркеры `+`/`-`/пробел) с потолком строк.
+fn render_diff_ops(old: &str, new: &str) -> String {
+    let ops = runtime::diff::line_ops(old, new);
+    let mut out = String::new();
+    for op in ops.iter().take(DIFF_MAX_LINES) {
+        out.push(op.marker());
+        out.push_str(op.text());
         out.push('\n');
     }
-    if lines.len() > DIFF_MAX_LINES {
-        out.push_str(&format!("… ещё {} строк\n", lines.len() - DIFF_MAX_LINES));
+    if ops.len() > DIFF_MAX_LINES {
+        out.push_str(&format!("… ещё {} строк\n", ops.len() - DIFF_MAX_LINES));
     }
+    out
 }
 
 /// Извлекает `path` из JSON-инпута файлового тула.
@@ -2221,6 +2329,65 @@ impl MdBuilder {
 
 /// Открывает URL системным обработчиком (`open` на macOS, `xdg-open` на Linux).
 /// Fire-and-forget: вывод глушим, ошибки игнорируем.
+/// Новая версия кода из unified-diff-текста: контекст и добавленные строки без
+/// маркеров; удалённые (`-`) и служебные («… ещё N строк») выбрасываются. Это
+/// то, что человек хочет вставить после клика по diff-панели.
+fn diff_new_version(diff: &str) -> String {
+    let mut out = String::new();
+    for line in diff.lines() {
+        match line.chars().next() {
+            Some('+' | ' ') => {
+                out.push_str(&line[1..]);
+                out.push('\n');
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Копирует текст в буфер обмена: сперва системная утилита (pbcopy/xclip/clip),
+/// при её отсутствии — OSC 52 (эскейп терминала; работает и по SSH, что важно
+/// для закрытых контуров без clipboard-утилит).
+fn copy_text_to_clipboard(text: &str) -> Result<(), String> {
+    match crate::copy_to_clipboard(text) {
+        Ok(()) => Ok(()),
+        Err(system_error) => {
+            use std::io::Write as _;
+            let mut stdout = std::io::stdout().lock();
+            let payload = base64_encode(text.as_bytes());
+            stdout
+                .write_all(format!("\x1b]52;c;{payload}\x07").as_bytes())
+                .and_then(|()| stdout.flush())
+                .map_err(|osc_error| format!("{system_error}; OSC52: {osc_error}"))
+        }
+    }
+}
+
+/// Минимальный base64 (RFC 4648) для OSC 52 — чтобы не тянуть зависимость.
+fn base64_encode(data: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        out.push(ALPHABET[(n >> 18) as usize & 63] as char);
+        out.push(ALPHABET[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
 fn open_url(url: &str) {
     let program = if cfg!(target_os = "macos") {
         "open"
@@ -2260,6 +2427,7 @@ fn keymap_text() -> String {
         "  Сессии:           Tab — фокус в меню сессий (там j/k — листать, Tab/Enter/Esc — назад)",
         "                    gt / gT — след/пред · Ctrl+N — новая · Ctrl+W — закрыть · Ctrl+P — закрепить",
         "  Экран:            Ctrl+E — свернуть сайдбар · Ctrl+T — тема · PgUp/PgDn — прокрутка",
+        "  Мышь:             клик по ссылке — открыть · клик по блоку кода/диффу — скопировать",
         "  Команды:          /help — все команды · /keymap — эта справка",
     ]
     .join("\n")
@@ -2475,6 +2643,30 @@ mod tests {
         assert!(diff.contains("-let a = 1;"));
         assert!(diff.contains("+let a = 2;"));
         assert_eq!(edit_path(input).as_deref(), Some("src/x.rs"));
+    }
+
+    #[test]
+    fn edit_diff_interleaves_changes_with_context() {
+        let input = serde_json::json!({
+            "path": "src/x.rs",
+            "old_string": "fn main() {\n    let a = 1;\n    println!(\"{a}\");\n}",
+            "new_string": "fn main() {\n    let a = 2;\n    println!(\"{a}\");\n}",
+        })
+        .to_string();
+        let diff = build_edit_diff("edit_file", &input).expect("diff");
+        let lines: Vec<&str> = diff.lines().collect();
+        // Общие строки — контекст (' '), изменения перемежаются, а не идут
+        // двумя блоками «старая версия, потом новая».
+        assert_eq!(
+            lines,
+            vec![
+                " fn main() {",
+                "-    let a = 1;",
+                "+    let a = 2;",
+                "     println!(\"{a}\");",
+                " }",
+            ]
+        );
     }
 
     #[test]

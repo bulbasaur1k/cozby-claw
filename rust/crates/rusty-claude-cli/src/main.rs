@@ -26,10 +26,10 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use api::{
-    resolve_startup_auth_source, AnthropicClient, AuthSource, ContentBlockDelta, InputContentBlock,
-    InputMessage, MessageRequest, MessageResponse, OpenAiCompatClient, OpenAiCompatConfig,
-    OutputContentBlock, PromptCache, ProviderClient, ProviderSlot, ProviderSlotKind,
-    ProvidersConfig, StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition,
+    resolve_startup_auth_source, AnthropicClient, AuthSource, AuthType, ContentBlockDelta,
+    InputContentBlock, InputMessage, MessageRequest, MessageResponse, OpenAiCompatClient,
+    OpenAiCompatConfig, OutputContentBlock, PromptCache, ProviderClient, ProviderSlot,
+    ProviderSlotKind, ProvidersConfig, StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition,
     ToolResultContentBlock,
 };
 
@@ -5543,15 +5543,20 @@ fn build_primary_provider_client(
     session_id: &str,
     model: String,
 ) -> Result<(ProviderClient, String, u32), Box<dyn std::error::Error>> {
-    eprintln!("[DEBUG] build_primary_provider_client: model={}", model);
+    // Диагностика выбора провайдера — только под CLAW_AUTH_DEBUG, иначе эти
+    // строки шумят в stderr при каждом старте.
+    let debug = env::var("CLAW_AUTH_DEBUG").is_ok_and(|value| value != "0" && !value.is_empty());
+    if debug {
+        eprintln!("[DEBUG] build_primary_provider_client: model={model}");
+    }
     let config = ProvidersConfig::load();
-    eprintln!("[DEBUG] ProvidersConfig loaded: primary={:?}", config.primary.as_ref().map(|s| &s.model));
-    
+
     if let Some(slot) = config.primary {
-        eprintln!("[DEBUG] Slot kind={:?}, model={}", slot.kind, slot.model);
+        if debug {
+            eprintln!("[DEBUG] Slot kind={:?}, model={}", slot.kind, slot.model);
+        }
         match slot.kind {
             ProviderSlotKind::Openai => {
-                eprintln!("[DEBUG] Using OpenAI client");
                 return Ok((
                     ProviderClient::OpenAi(slot.openai_client()),
                     slot.model,
@@ -5559,7 +5564,6 @@ fn build_primary_provider_client(
                 ));
             }
             ProviderSlotKind::Anthropic => {
-                eprintln!("[DEBUG] Using Anthropic client");
                 let auth = if slot.api_key.trim().is_empty() {
                     resolve_cli_auth_source()?
                 } else {
@@ -5577,7 +5581,9 @@ fn build_primary_provider_client(
             }
         }
     }
-    eprintln!("[DEBUG] No providers.toml primary, falling back to Anthropic");
+    if debug {
+        eprintln!("[DEBUG] No providers.toml primary, falling back to Anthropic");
+    }
     // Fallback на Anthropic из env
     let client = AnthropicClient::from_auth(resolve_cli_auth_source()?)
         .with_base_url(api::read_base_url())
@@ -6178,18 +6184,49 @@ fn format_write_result(icon: &str, parsed: &serde_json::Value) -> String {
     )
 }
 
+/// Максимум строк diff-превью правки в REPL-режиме. Раньше было 2 хунка по
+/// 6 строк — большие правки было не разглядеть.
+const PATCH_PREVIEW_MAX_LINES: usize = 40;
+
+/// Общий renderer для подсветки превью (syntect-инициализация не бесплатная —
+/// не пересоздаём на каждую правку).
+fn preview_renderer() -> &'static TerminalRenderer {
+    static RENDERER: std::sync::OnceLock<TerminalRenderer> = std::sync::OnceLock::new();
+    RENDERER.get_or_init(TerminalRenderer::new)
+}
+
 fn format_structured_patch_preview(parsed: &serde_json::Value) -> Option<String> {
     let hunks = parsed.get("structuredPatch")?.as_array()?;
+    // Язык — по расширению файла; подсветка кода сохраняется и в diff.
+    let path = extract_tool_path(parsed);
+    let lang = std::path::Path::new(path.as_str())
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("txt")
+        .to_string();
+    let renderer = preview_renderer();
+
     let mut preview = Vec::new();
-    for hunk in hunks.iter().take(2) {
+    let mut skipped = 0usize;
+    for hunk in hunks {
         let lines = hunk.get("lines")?.as_array()?;
-        for line in lines.iter().filter_map(|value| value.as_str()).take(6) {
-            match line.chars().next() {
-                Some('+') => preview.push(format!("\x1b[38;5;70m{line}\x1b[0m")),
-                Some('-') => preview.push(format!("\x1b[38;5;203m{line}\x1b[0m")),
-                _ => preview.push(line.to_string()),
+        for line in lines.iter().filter_map(|value| value.as_str()) {
+            if preview.len() >= PATCH_PREVIEW_MAX_LINES {
+                skipped += 1;
+                continue;
             }
+            let (gutter, content) = match line.chars().next() {
+                Some('+') => ("\x1b[1;38;5;70m+\x1b[0m ", &line[1..]),
+                Some('-') => ("\x1b[1;38;5;203m-\x1b[0m ", &line[1..]),
+                Some(' ') => ("  ", &line[1..]),
+                _ => ("  ", line),
+            };
+            let highlighted = renderer.highlight_code(content, &lang);
+            preview.push(format!("{gutter}{}", highlighted.trim_end_matches('\n')));
         }
+    }
+    if skipped > 0 {
+        preview.push(format!("\x1b[2m… ещё {skipped} строк\x1b[0m"));
     }
     if preview.is_empty() {
         None
@@ -6457,6 +6494,16 @@ fn prompt_cache_record_to_runtime_event(
     })
 }
 
+/// Решение ревьюера перед отправкой обезличенного payload во внешнюю модель.
+enum ExternalReviewOutcome {
+    /// Человек посмотрел payload и разрешил отправку.
+    Approved,
+    /// Человек отказал — ничего не отправляется.
+    Declined,
+    /// Ревью показать некому/негде (нет интерактивного терминала) — fail closed.
+    Unavailable,
+}
+
 /// Resolved external-consult capability: the configured external model plus
 /// the API key read from the environment. Present only when the feature is
 /// enabled AND the key env var is set, so the tool is offered solely when it
@@ -6465,6 +6512,12 @@ fn prompt_cache_record_to_runtime_event(
 struct ExternalConsultRuntime {
     config: ExternalConsultConfig,
     api_key: String,
+    /// Слот `[auxiliary]` из providers.toml, если консульт настроен через него.
+    /// Хранится целиком, чтобы вспомогательная модель работала так же, как
+    /// основная: уважается `type` (anthropic/openai), весь auth-стек
+    /// (`auth_type = command` с ленивым токеном и 401-ретраем, custom_headers,
+    /// подстановки `${env:}`/`${cmd:}`/`${file:}`) и `max_tokens`.
+    slot: Option<ProviderSlot>,
 }
 
 impl ExternalConsultRuntime {
@@ -6481,13 +6534,22 @@ impl ExternalConsultRuntime {
         Some(Self {
             config: config.clone(),
             api_key,
+            slot: None,
         })
     }
 
-    /// Строит вспомогательную модель из слота `[auxiliary]` providers.toml.
-    /// Ключ берётся прямо из файла (а не из env), endpoint — OpenAI-совместимый.
+    /// Строит вспомогательную модель из слота `[auxiliary]` providers.toml —
+    /// с той же семантикой, что у `[primary]` (type/auth_type/max_tokens).
     fn from_provider_slot(slot: &ProviderSlot) -> Option<Self> {
-        if slot.api_key.trim().is_empty() || slot.model.trim().is_empty() {
+        if slot.model.trim().is_empty() {
+            return None;
+        }
+        // Пустой api_key допустим, когда токен приходит из другого источника:
+        // auth-команда/кастомные заголовки, либо anthropic с OAuth/env-ключом.
+        let has_auth = !slot.api_key.trim().is_empty()
+            || matches!(slot.auth_type, AuthType::Command | AuthType::Custom)
+            || matches!(slot.kind, ProviderSlotKind::Anthropic);
+        if !has_auth {
             return None;
         }
         Some(Self {
@@ -6495,13 +6557,14 @@ impl ExternalConsultRuntime {
                 enabled: true,
                 model: slot.model.clone(),
                 base_url: slot.base_url.clone(),
-                // Ключ задан напрямую в слоте — env-имя не используется.
+                // Ключ задан в самом слоте — env-имя не используется.
                 api_key_env: String::new(),
                 audit_log: None,
                 // Слот `[auxiliary]` не задаёт autoApprove — ручное ревью по умолчанию.
                 auto_approve: false,
             },
             api_key: slot.api_key.clone(),
+            slot: Some(slot.clone()),
         })
     }
 
@@ -6525,7 +6588,38 @@ impl ExternalConsultRuntime {
 
     /// Anonymize → review → send → de-anonymize → audit. Returns the answer
     /// with real identifiers restored, or a declined/error message.
+    ///
+    /// Ревью через stdin — для REPL-режима. TUI использует
+    /// [`Self::run_with_reviewer`] с модалкой (stdin там занят raw-режимом
+    /// ratatui: promрt был бы невидим, а `read_line` дрался бы с event-loop).
     fn run(&self, question: &str, context: Option<&str>) -> Result<String, ToolError> {
+        self.run_with_reviewer(question, context, &mut |runtime, payload, anon| {
+            // Without an interactive terminal we cannot show the payload to a
+            // human, so we refuse to send (fail closed).
+            if !io::stdin().is_terminal() {
+                return Ok(ExternalReviewOutcome::Unavailable);
+            }
+            runtime.review_and_confirm(payload, anon).map(|approved| {
+                if approved {
+                    ExternalReviewOutcome::Approved
+                } else {
+                    ExternalReviewOutcome::Declined
+                }
+            })
+        })
+    }
+
+    /// Как [`Self::run`], но с внешним ревьюером: TUI подставляет модалку.
+    fn run_with_reviewer(
+        &self,
+        question: &str,
+        context: Option<&str>,
+        reviewer: &mut dyn FnMut(
+            &Self,
+            &str,
+            &Anonymizer,
+        ) -> Result<ExternalReviewOutcome, ToolError>,
+    ) -> Result<String, ToolError> {
         // 0. Fail-closed secret/PII gate. For commercial / critical projects the
         //    single hard rule is that no credential, key, customer data or
         //    proprietary secret ever leaves the machine. If the payload contains
@@ -6570,24 +6664,24 @@ impl ExternalConsultRuntime {
         let sent_decision = if self.config.auto_approve {
             "sent-auto"
         } else {
-            // Without an interactive terminal we cannot show the payload to a
-            // human, so we refuse to send (fail closed).
-            if !io::stdin().is_terminal() {
-                self.audit("declined-noninteractive", &payload, anon.redactions().len());
-                return Ok(
-                    "External consultation skipped: no interactive terminal to review the \
-                     outgoing payload (required before any data leaves for an external model). \
-                     Set externalConsult.autoApprove = true only for a trusted endpoint."
-                        .to_string(),
-                );
+            match reviewer(self, &payload, &anon)? {
+                ExternalReviewOutcome::Unavailable => {
+                    self.audit("declined-noninteractive", &payload, anon.redactions().len());
+                    return Ok(
+                        "External consultation skipped: no interactive terminal to review the \
+                         outgoing payload (required before any data leaves for an external model). \
+                         Set externalConsult.autoApprove = true only for a trusted endpoint."
+                            .to_string(),
+                    );
+                }
+                ExternalReviewOutcome::Declined => {
+                    self.audit("declined", &payload, anon.redactions().len());
+                    return Ok(
+                        "External consultation declined by user; nothing was sent.".to_string()
+                    );
+                }
+                ExternalReviewOutcome::Approved => "sent",
             }
-            if !self.review_and_confirm(&payload, &anon)? {
-                self.audit("declined", &payload, anon.redactions().len());
-                return Ok(
-                    "External consultation declined by user; nothing was sent.".to_string()
-                );
-            }
-            "sent"
         };
 
         // 3. Send the anonymized payload to the external model.
@@ -6630,11 +6724,46 @@ impl ExternalConsultRuntime {
         ))
     }
 
-    /// Blocking call to the external (OpenAI-compatible) endpoint.
+    /// Клиент вспомогательной модели — тем же кодом, что и для `[primary]`:
+    /// `type` слота выбирает протокол, auth-стек общий (command-auth с ленивым
+    /// токеном и 401-ретраем, custom_headers, подстановки).
+    fn build_client(&self) -> Result<ProviderClient, ToolError> {
+        match &self.slot {
+            Some(slot) => match slot.kind {
+                ProviderSlotKind::Openai => Ok(ProviderClient::OpenAi(slot.openai_client())),
+                ProviderSlotKind::Anthropic => {
+                    let auth = if slot.api_key.trim().is_empty() {
+                        resolve_cli_auth_source()
+                            .map_err(|error| ToolError::new(error.to_string()))?
+                    } else {
+                        AuthSource::ApiKey(slot.api_key.clone())
+                    };
+                    let base_url = if slot.base_url.trim().is_empty() {
+                        api::read_base_url()
+                    } else {
+                        slot.base_url.clone()
+                    };
+                    Ok(ProviderClient::Anthropic(
+                        AnthropicClient::from_auth(auth).with_base_url(base_url),
+                    ))
+                }
+            },
+            // Путь `externalConsult` из settings.json: OpenAI-совместимый
+            // endpoint с bearer-ключом из env — как и раньше.
+            None => Ok(ProviderClient::OpenAi(
+                OpenAiCompatClient::new(self.api_key.clone(), OpenAiCompatConfig::openai())
+                    .with_base_url(self.config.base_url.clone()),
+            )),
+        }
+    }
+
+    /// Blocking call to the configured external endpoint.
     fn send(&self, payload: &str) -> Result<String, ToolError> {
         let request = MessageRequest {
             model: self.config.model.clone(),
-            max_tokens: 2048,
+            // Паритет с primary: у слота уважаем его max_tokens; для
+            // settings.json-пути остаётся прежний потолок 2048.
+            max_tokens: self.slot.as_ref().map_or(2048, |slot| slot.max_tokens),
             messages: vec![InputMessage::user_text(payload.to_string())],
             system: Some(
                 "You are a senior engineering assistant. The user asks about a minimal, \
@@ -6649,8 +6778,7 @@ impl ExternalConsultRuntime {
             tool_choice: None,
             stream: false,
         };
-        let client = OpenAiCompatClient::new(self.api_key.clone(), OpenAiCompatConfig::openai())
-            .with_base_url(self.config.base_url.clone());
+        let client = self.build_client()?;
         let tokio_runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -7156,6 +7284,7 @@ mod tests {
                 auto_approve: false,
             },
             api_key: "dummy".to_string(),
+            slot: None,
         };
 
         // Under `cargo test` stdin is not a TTY → must NOT send; returns a skip
@@ -7171,6 +7300,51 @@ mod tests {
         assert!(!log.contains("acme"), "real namespace leaked into audit: {log}");
         assert!(!log.contains("InvoiceService"), "real type leaked: {log}");
         let _ = fs::remove_file(&audit);
+    }
+
+    #[test]
+    fn auxiliary_slot_works_like_primary() {
+        use super::{ExternalConsultRuntime, ProviderClient, ProviderSlot};
+
+        // Command-auth без api_key — валидно: токен приходит из скрипта.
+        let command_slot: ProviderSlot = serde_json::from_value(json!({
+            "type": "openai",
+            "model": "big-model",
+            "base_url": "https://gw.corp/v1",
+            "auth_type": "command",
+            "auth_command": "corp-auth token",
+            "max_tokens": 4096,
+        }))
+        .expect("parses");
+        let runtime = ExternalConsultRuntime::from_provider_slot(&command_slot)
+            .expect("command-auth slot without api_key is accepted");
+        assert_eq!(runtime.config.model, "big-model");
+        assert!(matches!(
+            runtime.build_client().expect("client builds"),
+            ProviderClient::OpenAi(_)
+        ));
+
+        // Anthropic-слот строит Anthropic-клиента, а не OpenAI-совместимого.
+        let anthropic_slot: ProviderSlot = serde_json::from_value(json!({
+            "type": "anthropic",
+            "model": "claude-opus-4-8",
+            "api_key": "sk-ant-test",
+        }))
+        .expect("parses");
+        let runtime = ExternalConsultRuntime::from_provider_slot(&anthropic_slot)
+            .expect("anthropic slot accepted");
+        assert!(matches!(
+            runtime.build_client().expect("client builds"),
+            ProviderClient::Anthropic(_)
+        ));
+
+        // Bearer-слот без ключа — отклоняется, как и раньше.
+        let keyless: ProviderSlot = serde_json::from_value(json!({
+            "type": "openai",
+            "model": "m",
+        }))
+        .expect("parses");
+        assert!(ExternalConsultRuntime::from_provider_slot(&keyless).is_none());
     }
 
     fn registry_with_plugin_tool() -> GlobalToolRegistry {

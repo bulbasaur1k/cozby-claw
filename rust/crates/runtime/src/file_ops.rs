@@ -517,54 +517,79 @@ fn apply_limit<T>(
 /// модель контекстом. Всё сверх потолка сворачивается в маркер-строку.
 const MAX_PATCH_LINES: usize = 200;
 
+/// Строк контекста вокруг изменений в хунке — как `git diff -U3`.
+const PATCH_CONTEXT_LINES: usize = 3;
+
 fn make_patch(original: &str, updated: &str) -> Vec<StructuredPatchHunk> {
-    let old_lines: Vec<&str> = original.lines().collect();
-    let new_lines: Vec<&str> = updated.lines().collect();
+    use crate::diff::LineOp;
 
-    // Минимальный хунк: общие префикс и суффикс не входят в дифф.
-    let prefix = old_lines
-        .iter()
-        .zip(new_lines.iter())
-        .take_while(|(old, new)| old == new)
-        .count();
-    let max_suffix = old_lines.len().min(new_lines.len()) - prefix;
-    let suffix = old_lines
-        .iter()
-        .rev()
-        .zip(new_lines.iter().rev())
-        .take_while(|(old, new)| old == new)
-        .take(max_suffix)
-        .count();
+    let ops = crate::diff::line_ops(original, updated);
 
-    let removed = &old_lines[prefix..old_lines.len() - suffix];
-    let added = &new_lines[prefix..new_lines.len() - suffix];
-    if removed.is_empty() && added.is_empty() {
+    // Диапазоны хунков: вокруг каждой изменённой строки берём context,
+    // пересекающиеся диапазоны сливаем (как git diff -U3).
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    for (index, op) in ops.iter().enumerate() {
+        if matches!(op, LineOp::Equal(_)) {
+            continue;
+        }
+        let start = index.saturating_sub(PATCH_CONTEXT_LINES);
+        let end = (index + PATCH_CONTEXT_LINES + 1).min(ops.len());
+        match ranges.last_mut() {
+            Some((_, last_end)) if start <= *last_end => *last_end = end,
+            _ => ranges.push((start, end)),
+        }
+    }
+    if ranges.is_empty() {
         return Vec::new();
     }
 
-    let mut lines = Vec::new();
-    let mut push_side = |marker: char, side: &[&str]| {
-        let budget = MAX_PATCH_LINES / 2;
-        for line in side.iter().take(budget) {
-            lines.push(format!("{marker}{line}"));
-        }
-        if side.len() > budget {
-            lines.push(format!(
-                "{marker}… [{} more line(s) truncated]",
-                side.len() - budget
-            ));
-        }
-    };
-    push_side('-', removed);
-    push_side('+', added);
+    // Префиксные счётчики: сколько строк старой/новой версии лежит до ops[i].
+    let mut old_before = vec![0usize; ops.len() + 1];
+    let mut new_before = vec![0usize; ops.len() + 1];
+    for (index, op) in ops.iter().enumerate() {
+        old_before[index + 1] =
+            old_before[index] + usize::from(!matches!(op, LineOp::Insert(_)));
+        new_before[index + 1] =
+            new_before[index] + usize::from(!matches!(op, LineOp::Remove(_)));
+    }
 
-    vec![StructuredPatchHunk {
-        old_start: prefix + 1,
-        old_lines: removed.len(),
-        new_start: prefix + 1,
-        new_lines: added.len(),
-        lines,
-    }]
+    let mut hunks = Vec::new();
+    let mut total_lines = 0usize;
+    for (start, end) in ranges {
+        let (mut old_count, mut new_count) = (0usize, 0usize);
+        let mut lines = Vec::new();
+        let mut truncated = 0usize;
+        for op in &ops[start..end] {
+            match op {
+                LineOp::Equal(_) => {
+                    old_count += 1;
+                    new_count += 1;
+                }
+                LineOp::Remove(_) => old_count += 1,
+                LineOp::Insert(_) => new_count += 1,
+            }
+            if total_lines < MAX_PATCH_LINES {
+                lines.push(format!("{}{}", op.marker(), op.text()));
+                total_lines += 1;
+            } else {
+                truncated += 1;
+            }
+        }
+        if truncated > 0 {
+            lines.push(format!(" … [{truncated} more line(s) truncated]"));
+        }
+        hunks.push(StructuredPatchHunk {
+            old_start: old_before[start] + 1,
+            old_lines: old_count,
+            new_start: new_before[start] + 1,
+            new_lines: new_count,
+            lines,
+        });
+        if total_lines >= MAX_PATCH_LINES {
+            break;
+        }
+    }
+    hunks
 }
 
 fn normalize_path(path: &str) -> io::Result<PathBuf> {

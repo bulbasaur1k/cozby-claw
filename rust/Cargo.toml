@@ -1,5 +1,9 @@
 [workspace]
 members = ["crates/*"]
+# GUI не поддерживается (release.sh ставит только CLI) — не собираем его
+# впустую при `cargo build --workspace`. Окончательное удаление:
+#   git rm -r crates/gui
+exclude = ["crates/gui"]
 resolver = "2"
 
 [workspace.package]

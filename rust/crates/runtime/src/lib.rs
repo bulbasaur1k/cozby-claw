@@ -12,6 +12,7 @@ mod compact;
 mod config;
 mod conversation;
 pub mod defaults;
+pub mod diff;
 mod file_ops;
 pub mod green_contract;
 mod hooks;
