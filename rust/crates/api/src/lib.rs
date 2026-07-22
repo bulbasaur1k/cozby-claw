@@ -20,7 +20,7 @@ pub use providers::openai_compat::{OpenAiCompatClient, OpenAiCompatConfig};
 pub use providers::{
     detect_provider_kind, max_tokens_for_model, resolve_model_alias, ProviderKind,
 };
-pub use providers_config::{ProviderSlot, ProviderSlotKind, ProvidersConfig};
+pub use providers_config::{AuthType, ProviderSlot, ProviderSlotKind, ProvidersConfig};
 pub use sse::{parse_frame, SseParser};
 pub use types::{
     ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent, ContentBlockStopEvent,

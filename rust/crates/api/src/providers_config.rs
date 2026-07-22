@@ -26,6 +26,7 @@ macro_rules! auth_debug {
         }
     };
 }
+pub(crate) use auth_debug;
 
 /// Протокол провайдера в слоте — какой «диалект» API использовать.
 ///
@@ -121,11 +122,27 @@ fn expand_template(input: &str) -> String {
 /// или aws `credential_process`, поэтому пригодна для произвольных auth-скриптов.
 /// Результат кэшируется на `CLAW_AUTH_CMD_TTL_SECS` секунд (дефолт 300, `0` — без
 /// кэша), чтобы не форкать процесс на каждый билд клиента.
-fn run_auth_command(command: &str) -> String {
+/// Кэш токенов от auth-команд: команда → (момент получения, токен).
+/// Вынесен на уровень модуля, чтобы 401-обработчик мог инвалидировать запись
+/// и следующий запрос получил свежий токен от скрипта.
+fn auth_command_cache(
+) -> &'static std::sync::Mutex<HashMap<String, (std::time::Instant, String)>> {
     use std::sync::{Mutex, OnceLock};
-    use std::time::Instant;
+    static CACHE: OnceLock<Mutex<HashMap<String, (std::time::Instant, String)>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
-    static CACHE: OnceLock<Mutex<HashMap<String, (Instant, String)>>> = OnceLock::new();
+/// Сбрасывает закэшированный токен команды — зовётся при 401/403, чтобы
+/// перезапросить токен у скрипта, не дожидаясь истечения TTL.
+pub(crate) fn invalidate_auth_command_cache(command: &str) {
+    if let Ok(mut guard) = auth_command_cache().lock() {
+        guard.remove(command.trim());
+    }
+}
+
+pub(crate) fn run_auth_command(command: &str) -> String {
+    use std::time::Instant;
 
     let command = command.trim();
     if command.is_empty() {
@@ -137,7 +154,7 @@ fn run_auth_command(command: &str) -> String {
         .and_then(|value| value.trim().parse::<u64>().ok())
         .unwrap_or(300);
 
-    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let cache = auth_command_cache();
 
     if ttl > 0 {
         if let Ok(guard) = cache.lock() {
@@ -264,21 +281,29 @@ impl ProviderSlot {
             }
             AuthType::Command => {
                 // Токен из внешней команды → произвольный заголовок, плюс любые
-                // дополнительные custom_headers. Провайдер-агностично.
-                let mut headers = self.expanded_custom_headers();
-                if let Some(command) = self.auth_command.as_deref() {
-                    let token = run_auth_command(command);
-                    if token.is_empty() {
-                        auth_debug!("[DEBUG] auth_command produced empty token");
-                    } else {
-                        let header = self.auth_header.as_deref().unwrap_or("Authorization");
-                        let format = self.auth_format.as_deref().unwrap_or("Bearer {token}");
-                        headers.insert(header.to_string(), format.replace("{token}", &token));
+                // дополнительные custom_headers. Провайдер-агностично. Токен НЕ
+                // запекается при построении клиента: он разрешается на каждый
+                // запрос (сквозь TTL-кэш), поэтому протухший токен обновляется
+                // без рестарта процесса, а 401 инвалидирует кэш и ретраится.
+                let headers = self.expanded_custom_headers();
+                match self.auth_command.as_deref().map(str::trim) {
+                    Some(command) if !command.is_empty() => Ok(AuthSource::CommandAuth {
+                        command: command.to_string(),
+                        header: self
+                            .auth_header
+                            .clone()
+                            .unwrap_or_else(|| "Authorization".to_string()),
+                        format: self
+                            .auth_format
+                            .clone()
+                            .unwrap_or_else(|| "Bearer {token}".to_string()),
+                        extra_headers: headers,
+                    }),
+                    _ => {
+                        auth_debug!("[DEBUG] auth_type=command but auth_command is unset");
+                        Ok(AuthSource::CustomHeaders(headers))
                     }
-                } else {
-                    auth_debug!("[DEBUG] auth_type=command but auth_command is unset");
                 }
-                Ok(AuthSource::CustomHeaders(headers))
             }
         }
     }
@@ -513,13 +538,22 @@ mod tests {
             .expect("parses")
             .primary
             .expect("primary");
+        // Токен больше не запекается при построении клиента: командная
+        // аутентификация ленивая, разрешается на каждый запрос (обновление
+        // протухшего токена без рестарта).
         match slot.build_auth_source().expect("auth") {
-            AuthSource::CustomHeaders(headers) => assert_eq!(
-                headers.get("Authorization").map(String::as_str),
-                Some("Bearer tok-123"),
-                "default header/format is `Authorization: Bearer {{token}}`"
-            ),
-            other => panic!("expected CustomHeaders, got {other:?}"),
+            AuthSource::CommandAuth {
+                command,
+                header,
+                format,
+                extra_headers,
+            } => {
+                assert_eq!(command, "printf tok-123");
+                assert_eq!(header, "Authorization", "default header");
+                assert_eq!(format, "Bearer {token}", "default format");
+                assert!(extra_headers.is_empty());
+            }
+            other => panic!("expected CommandAuth, got {other:?}"),
         }
     }
 
@@ -539,11 +573,38 @@ mod tests {
             .primary
             .expect("primary");
         match slot.build_auth_source().expect("auth") {
-            AuthSource::CustomHeaders(headers) => {
-                assert_eq!(headers.get("X-Token").map(String::as_str), Some("abc"));
+            AuthSource::CommandAuth { command, header, format, .. } => {
+                assert_eq!(command, "printf abc");
+                assert_eq!(header, "X-Token");
+                assert_eq!(format, "{token}");
             }
-            other => panic!("expected CustomHeaders, got {other:?}"),
+            other => panic!("expected CommandAuth, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn invalidate_auth_command_cache_forces_refetch() {
+        // Скрипт пишет разный вывод при каждом запуске (счётчик в файле).
+        let dir = std::env::temp_dir().join(format!(
+            "claw-auth-cache-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let counter = dir.join("counter");
+        std::fs::write(&counter, "0").expect("seed counter");
+        let command = format!(
+            "n=$(cat {path}); n=$((n+1)); printf %s $n > {path}; printf token-$n",
+            path = counter.display()
+        );
+
+        let first = super::run_auth_command(&command);
+        assert_eq!(first, "token-1");
+        // Повторный вызов внутри TTL — из кэша, скрипт не перезапускается.
+        assert_eq!(super::run_auth_command(&command), "token-1");
+        // 401-путь: инвалидация заставляет перезапросить токен у скрипта.
+        super::invalidate_auth_command_cache(&command);
+        assert_eq!(super::run_auth_command(&command), "token-2");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

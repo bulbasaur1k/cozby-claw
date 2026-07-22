@@ -14,6 +14,7 @@ use crate::types::{
 };
 
 use super::{Provider, ProviderFuture};
+use crate::providers_config::auth_debug;
 
 /// Источником аутентификации для OpenAI-совместимых провайдеров.
 /// Поддерживает различные схемы: Bearer token, API Key, кастомные заголовки.
@@ -29,6 +30,19 @@ pub enum AuthSource {
     ApiKeyAndBearer {
         api_key: String,
         bearer_token: String,
+    },
+    /// Токен от внешней команды (`auth_type = "command"` в providers.toml).
+    /// Разрешается на каждый запрос через TTL-кэш `run_auth_command`, поэтому
+    /// протухший токен обновляется без рестарта; при 401/403 кэш инвалидируется
+    /// и запрос повторяется один раз со свежим токеном.
+    CommandAuth {
+        command: String,
+        /// Заголовок для токена (обычно `Authorization`).
+        header: String,
+        /// Шаблон значения; `{token}` заменяется выводом команды.
+        format: String,
+        /// Дополнительные статические заголовки.
+        extra_headers: BTreeMap<String, String>,
     },
 }
 
@@ -82,7 +96,45 @@ impl AuthSource {
             Self::ApiKeyAndBearer { api_key, bearer_token } => request_builder
                 .header("X-API-Key", api_key)
                 .bearer_auth(bearer_token),
+            Self::CommandAuth {
+                command,
+                header,
+                format,
+                extra_headers,
+            } => {
+                let mut builder = request_builder;
+                for (key, value) in extra_headers {
+                    builder = builder.header(key, value);
+                }
+                let token = crate::providers_config::run_auth_command(command);
+                if token.is_empty() {
+                    auth_debug!("[DEBUG] auth_command produced empty token");
+                } else {
+                    builder = builder.header(header, format.replace("{token}", &token));
+                }
+                builder
+            }
         }
+    }
+
+    /// Если ошибка — 401/403 при командной аутентификации, сбрасывает кэш
+    /// токена (следующий `apply` перезапросит его у скрипта) и возвращает
+    /// `true` — сигнал повторить запрос один раз со свежим токеном.
+    pub(crate) fn refresh_on_unauthorized(&self, error: &ApiError) -> bool {
+        let Self::CommandAuth { command, .. } = self else {
+            return false;
+        };
+        let unauthorized = matches!(
+            error,
+            ApiError::Api { status, .. }
+                if *status == reqwest::StatusCode::UNAUTHORIZED
+                    || *status == reqwest::StatusCode::FORBIDDEN
+        );
+        if unauthorized {
+            auth_debug!("[DEBUG] 401/403 with command auth — refreshing token via auth_command");
+            crate::providers_config::invalidate_auth_command_cache(command);
+        }
+        unauthorized
     }
 }
 
@@ -254,6 +306,10 @@ impl OpenAiCompatClient {
         request: &MessageRequest,
     ) -> Result<reqwest::Response, ApiError> {
         let mut attempts = 0;
+        // 401/403 при командной аутентификации — признак протухшего токена:
+        // сбрасываем кэш auth-команды и повторяем один раз со свежим токеном
+        // (иначе долгоживущий процесс навсегда залипал бы на старом токене).
+        let mut auth_refreshed = false;
 
         let last_error = loop {
             attempts += 1;
@@ -261,7 +317,14 @@ impl OpenAiCompatClient {
                 Ok(response) => match expect_success(response).await {
                     Ok(response) => return Ok(response),
                     Err(error) if error.is_retryable() && attempts <= self.max_retries + 1 => error,
-                    Err(error) => return Err(error),
+                    Err(error) => {
+                        if !auth_refreshed && self.auth.refresh_on_unauthorized(&error) {
+                            auth_refreshed = true;
+                            attempts -= 1;
+                            continue;
+                        }
+                        return Err(error);
+                    }
                 },
                 Err(error) if error.is_retryable() && attempts <= self.max_retries + 1 => error,
                 Err(error) => return Err(error),
