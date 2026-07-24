@@ -801,7 +801,6 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
     use std::sync::Arc;
-    use std::time::{SystemTime, UNIX_EPOCH};
     use telemetry::{MemoryTelemetrySink, SessionTracer, TelemetryEvent};
 
     struct ScriptedApiClient {
@@ -1446,11 +1445,10 @@ mod tests {
     }
 
     fn temp_session_path(label: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time should be after epoch")
-            .as_nanos();
-        std::env::temp_dir().join(format!("runtime-conversation-{label}-{nanos}.json"))
+        std::env::temp_dir().join(format!(
+            "runtime-conversation-{label}-{}.json",
+            crate::test_unique_suffix()
+        ))
     }
 
     #[cfg(windows)]

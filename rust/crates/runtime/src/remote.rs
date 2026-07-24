@@ -259,14 +259,9 @@ mod tests {
     use std::collections::BTreeMap;
     use std::fs;
     use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_dir() -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time should be after epoch")
-            .as_nanos();
-        std::env::temp_dir().join(format!("runtime-remote-{nanos}"))
+        std::env::temp_dir().join(format!("runtime-remote-{}", crate::test_unique_suffix()))
     }
 
     #[test]

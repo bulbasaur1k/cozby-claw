@@ -688,7 +688,6 @@ pub fn is_symlink_escape(path: &Path, workspace_root: &Path) -> io::Result<bool>
 
 #[cfg(test)]
 mod tests {
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
         edit_file, glob_search, grep_search, is_symlink_escape, read_file, read_file_in_workspace,
@@ -696,11 +695,10 @@ mod tests {
     };
 
     fn temp_path(name: &str) -> std::path::PathBuf {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time should move forward")
-            .as_nanos();
-        std::env::temp_dir().join(format!("clawd-native-{name}-{unique}"))
+        std::env::temp_dir().join(format!(
+            "clawd-native-{name}-{}",
+            crate::test_unique_suffix()
+        ))
     }
 
     #[test]

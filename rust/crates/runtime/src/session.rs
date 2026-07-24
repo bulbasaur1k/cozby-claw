@@ -939,7 +939,6 @@ mod tests {
     use crate::usage::TokenUsage;
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn persists_and_restores_session_jsonl() {
@@ -1207,11 +1206,10 @@ mod tests {
     }
 
     fn temp_session_path(label: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time should be after epoch")
-            .as_nanos();
-        std::env::temp_dir().join(format!("runtime-session-{label}-{nanos}.json"))
+        std::env::temp_dir().join(format!(
+            "runtime-session-{label}-{}.json",
+            crate::test_unique_suffix()
+        ))
     }
 
     fn write_temp_session_file(label: &str, contents: &str) -> PathBuf {

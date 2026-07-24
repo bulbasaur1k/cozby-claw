@@ -1282,7 +1282,6 @@ mod tests {
     use crate::json::JsonValue;
     use crate::sandbox::FilesystemIsolationMode;
     use std::fs;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn external_consult_absent_is_none() {
@@ -1408,11 +1407,7 @@ mod tests {
     }
 
     fn temp_dir() -> std::path::PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time should be after epoch")
-            .as_nanos();
-        std::env::temp_dir().join(format!("runtime-config-{nanos}"))
+        std::env::temp_dir().join(format!("runtime-config-{}", crate::test_unique_suffix()))
     }
 
     #[test]

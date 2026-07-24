@@ -169,14 +169,12 @@ fn missing_fix_subjects(a: &str, b: &str, repo_path: &Path) -> Vec<String> {
 mod tests {
     use super::*;
     use std::fs;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_dir() -> std::path::PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time should be after epoch")
-            .as_nanos();
-        std::env::temp_dir().join(format!("runtime-stale-branch-{nanos}"))
+        std::env::temp_dir().join(format!(
+            "runtime-stale-branch-{}",
+            crate::test_unique_suffix()
+        ))
     }
 
     fn init_repo(path: &Path) {
