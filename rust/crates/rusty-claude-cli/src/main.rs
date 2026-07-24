@@ -7399,6 +7399,26 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    /// Подменяет `CLAW_CONFIG_HOME` на пустую временную директорию, чтобы живой
+    /// `~/.claw/providers.toml` пользователя не влиял на дефолтную модель в
+    /// `parse_args`. Вызывающий обязан держать `env_lock()`.
+    fn with_isolated_config_home<T>(f: impl FnOnce() -> T) -> T {
+        let config_home = temp_dir();
+        std::fs::create_dir_all(&config_home).expect("config home should exist");
+        let original = std::env::var("CLAW_CONFIG_HOME").ok();
+        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        match original {
+            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
+            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&config_home);
+        match result {
+            Ok(value) => value,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
     fn with_current_dir<T>(cwd: &Path, f: impl FnOnce() -> T) -> T {
         let _guard = cwd_lock()
             .lock()
@@ -7459,14 +7479,16 @@ mod tests {
     fn defaults_to_repl_when_no_args() {
         let _guard = env_lock();
         std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
-        assert_eq!(
-            parse_args(&[]).expect("args should parse"),
-            CliAction::Repl {
-                model: DEFAULT_MODEL.to_string(),
-                allowed_tools: None,
-                permission_mode: PermissionMode::DangerFullAccess,
-            }
-        );
+        with_isolated_config_home(|| {
+            assert_eq!(
+                parse_args(&[]).expect("args should parse"),
+                CliAction::Repl {
+                    model: DEFAULT_MODEL.to_string(),
+                    allowed_tools: None,
+                    permission_mode: PermissionMode::DangerFullAccess,
+                }
+            );
+        });
     }
 
     #[test]
@@ -7546,16 +7568,18 @@ mod tests {
             "hello".to_string(),
             "world".to_string(),
         ];
-        assert_eq!(
-            parse_args(&args).expect("args should parse"),
-            CliAction::Prompt {
-                prompt: "hello world".to_string(),
-                model: DEFAULT_MODEL.to_string(),
-                output_format: CliOutputFormat::Text,
-                allowed_tools: None,
-                permission_mode: PermissionMode::DangerFullAccess,
-            }
-        );
+        with_isolated_config_home(|| {
+            assert_eq!(
+                parse_args(&args).expect("args should parse"),
+                CliAction::Prompt {
+                    prompt: "hello world".to_string(),
+                    model: DEFAULT_MODEL.to_string(),
+                    output_format: CliOutputFormat::Text,
+                    allowed_tools: None,
+                    permission_mode: PermissionMode::DangerFullAccess,
+                }
+            );
+        });
     }
 
     #[test]
@@ -7625,15 +7649,18 @@ mod tests {
 
     #[test]
     fn parses_permission_mode_flag() {
+        let _guard = env_lock();
         let args = vec!["--permission-mode=read-only".to_string()];
-        assert_eq!(
-            parse_args(&args).expect("args should parse"),
-            CliAction::Repl {
-                model: DEFAULT_MODEL.to_string(),
-                allowed_tools: None,
-                permission_mode: PermissionMode::ReadOnly,
-            }
-        );
+        with_isolated_config_home(|| {
+            assert_eq!(
+                parse_args(&args).expect("args should parse"),
+                CliAction::Repl {
+                    model: DEFAULT_MODEL.to_string(),
+                    allowed_tools: None,
+                    permission_mode: PermissionMode::ReadOnly,
+                }
+            );
+        });
     }
 
     #[test]
@@ -7645,19 +7672,21 @@ mod tests {
             "read,glob".to_string(),
             "--allowed-tools=write_file".to_string(),
         ];
-        assert_eq!(
-            parse_args(&args).expect("args should parse"),
-            CliAction::Repl {
-                model: DEFAULT_MODEL.to_string(),
-                allowed_tools: Some(
-                    ["glob_search", "read_file", "write_file"]
-                        .into_iter()
-                        .map(str::to_string)
-                        .collect()
-                ),
-                permission_mode: PermissionMode::DangerFullAccess,
-            }
-        );
+        with_isolated_config_home(|| {
+            assert_eq!(
+                parse_args(&args).expect("args should parse"),
+                CliAction::Repl {
+                    model: DEFAULT_MODEL.to_string(),
+                    allowed_tools: Some(
+                        ["glob_search", "read_file", "write_file"]
+                            .into_iter()
+                            .map(str::to_string)
+                            .collect()
+                    ),
+                    permission_mode: PermissionMode::DangerFullAccess,
+                }
+            );
+        });
     }
 
     #[test]
@@ -7776,25 +7805,27 @@ mod tests {
     fn parses_single_word_command_aliases_without_falling_back_to_prompt_mode() {
         let _guard = env_lock();
         std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
-        assert_eq!(
-            parse_args(&["help".to_string()]).expect("help should parse"),
-            CliAction::Help
-        );
-        assert_eq!(
-            parse_args(&["version".to_string()]).expect("version should parse"),
-            CliAction::Version
-        );
-        assert_eq!(
-            parse_args(&["status".to_string()]).expect("status should parse"),
-            CliAction::Status {
-                model: DEFAULT_MODEL.to_string(),
-                permission_mode: PermissionMode::DangerFullAccess,
-            }
-        );
-        assert_eq!(
-            parse_args(&["sandbox".to_string()]).expect("sandbox should parse"),
-            CliAction::Sandbox
-        );
+        with_isolated_config_home(|| {
+            assert_eq!(
+                parse_args(&["help".to_string()]).expect("help should parse"),
+                CliAction::Help
+            );
+            assert_eq!(
+                parse_args(&["version".to_string()]).expect("version should parse"),
+                CliAction::Version
+            );
+            assert_eq!(
+                parse_args(&["status".to_string()]).expect("status should parse"),
+                CliAction::Status {
+                    model: DEFAULT_MODEL.to_string(),
+                    permission_mode: PermissionMode::DangerFullAccess,
+                }
+            );
+            assert_eq!(
+                parse_args(&["sandbox".to_string()]).expect("sandbox should parse"),
+                CliAction::Sandbox
+            );
+        });
     }
 
     #[test]
@@ -7808,17 +7839,19 @@ mod tests {
     fn multi_word_prompt_still_uses_shorthand_prompt_mode() {
         let _guard = env_lock();
         std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
-        assert_eq!(
-            parse_args(&["help".to_string(), "me".to_string(), "debug".to_string()])
-                .expect("prompt shorthand should still work"),
-            CliAction::Prompt {
-                prompt: "help me debug".to_string(),
-                model: DEFAULT_MODEL.to_string(),
-                output_format: CliOutputFormat::Text,
-                allowed_tools: None,
-                permission_mode: PermissionMode::DangerFullAccess,
-            }
-        );
+        with_isolated_config_home(|| {
+            assert_eq!(
+                parse_args(&["help".to_string(), "me".to_string(), "debug".to_string()])
+                    .expect("prompt shorthand should still work"),
+                CliAction::Prompt {
+                    prompt: "help me debug".to_string(),
+                    model: DEFAULT_MODEL.to_string(),
+                    output_format: CliOutputFormat::Text,
+                    allowed_tools: None,
+                    permission_mode: PermissionMode::DangerFullAccess,
+                }
+            );
+        });
     }
 
     #[test]
