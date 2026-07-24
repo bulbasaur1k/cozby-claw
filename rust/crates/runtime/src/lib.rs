@@ -163,3 +163,21 @@ pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
+
+// Наносекунды сами по себе не уникальны: при параллельном старте тестов
+// часы дают одно значение двум потокам, тесты делят temp-каталог, и
+// remove_dir_all одного сносит файлы другого. Счётчик + pid исключают это.
+#[cfg(test)]
+pub(crate) fn test_unique_suffix() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("time should be after epoch")
+        .as_nanos();
+    format!(
+        "{}-{nanos}-{}",
+        std::process::id(),
+        NEXT_ID.fetch_add(1, Ordering::Relaxed)
+    )
+}

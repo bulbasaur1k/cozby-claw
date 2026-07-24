@@ -507,14 +507,9 @@ mod tests {
     use crate::config::ConfigLoader;
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_dir() -> std::path::PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time should be after epoch")
-            .as_nanos();
-        std::env::temp_dir().join(format!("runtime-prompt-{nanos}"))
+        std::env::temp_dir().join(format!("runtime-prompt-{}", crate::test_unique_suffix()))
     }
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {

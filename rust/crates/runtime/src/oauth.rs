@@ -455,7 +455,6 @@ fn decode_hex(byte: u8) -> Result<u8, String> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
         clear_oauth_credentials, code_challenge_s256, credentials_path, generate_pkce_pair,
@@ -481,12 +480,8 @@ mod tests {
 
     fn temp_config_home() -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
-            "runtime-oauth-test-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("time")
-                .as_nanos()
+            "runtime-oauth-test-{}",
+            crate::test_unique_suffix()
         ))
     }
 

@@ -1144,6 +1144,9 @@ mod tests {
             Vec::new(),
         ));
 
+        // Общий env-мьютекс: переменные окружения — глобальное состояние
+        // процесса, мутация без лока гонится с параллельными тестами.
+        let _guard = crate::test_env_lock();
         std::env::set_var("CLAW_HOOK_TIMEOUT_SECS", "1");
         let result = runner.run_post_tool_use("edit_file", r#"{"path":"a.rs"}"#, "done", false);
         std::env::remove_var("CLAW_HOOK_TIMEOUT_SECS");

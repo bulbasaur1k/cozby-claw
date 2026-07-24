@@ -172,14 +172,9 @@ fn set_executable(path: &Path) {
 mod tests {
     use super::{scaffold_config_home, DEFAULT_SKILLS};
     use std::fs;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_dir() -> std::path::PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time after epoch")
-            .as_nanos();
-        std::env::temp_dir().join(format!("claw-defaults-{nanos}"))
+        std::env::temp_dir().join(format!("claw-defaults-{}", crate::test_unique_suffix()))
     }
 
     #[test]

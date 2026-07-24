@@ -341,11 +341,10 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_dir() -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time should be after epoch")
-            .as_nanos();
-        std::env::temp_dir().join(format!("runtime-session-control-{nanos}"))
+        std::env::temp_dir().join(format!(
+            "runtime-session-control-{}",
+            crate::test_unique_suffix()
+        ))
     }
 
     fn persist_session(root: &Path, text: &str) -> Session {
